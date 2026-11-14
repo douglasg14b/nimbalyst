@@ -97,7 +97,13 @@ for (const from of fromPaths) {
   const parent = path.dirname(paired.expected);
   fs.mkdirSync(parent, { recursive: true });
   const target = path.relative(parent, paired.alternate);
-  fs.symlinkSync(target, paired.expected);
+  if (process.platform === 'win32' && fs.statSync(paired.alternate).isDirectory()) {
+    // A Windows symlink needs Developer Mode or admin (EPERM otherwise); a
+    // directory junction needs neither, but takes an absolute target.
+    fs.symlinkSync(paired.alternate, paired.expected, 'junction');
+  } else {
+    fs.symlinkSync(target, paired.expected);
+  }
   linked++;
   console.log(`[normalize-extra-resources] Linked ${from} -> ${target}`);
 }

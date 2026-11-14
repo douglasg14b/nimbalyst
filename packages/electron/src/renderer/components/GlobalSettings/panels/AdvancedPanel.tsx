@@ -5,6 +5,8 @@ import { MaterialSymbol } from '@nimbalyst/runtime/ui/icons/MaterialSymbol';
 import { SettingsToggle } from '../SettingsToggle';
 import { HelpTooltip } from '../../../help';
 import { requestConfirmation } from '../../../dialogs/requestConfirmation';
+import { isForkBuild } from '../../../../shared/forkBuild';
+import { ForkBuildSection } from './ForkBuildSection';
 import {
   advancedSettingsAtom,
   setAdvancedSettingsAtom,
@@ -413,7 +415,8 @@ export function AdvancedPanel() {
         </div>
       )}
 
-      {/* ── Release Channel ── */}
+      {/* ── Release Channel ── (fork builds: FORK.md; no channel, they never auto-update) */}
+      {isForkBuild() ? <ForkBuildSection /> : (
       <div className="provider-panel-section py-4 mb-4 border-b border-[var(--nim-border)] last:border-b-0 last:mb-0 last:pb-0">
         <h4 className="provider-panel-section-title text-base font-semibold mb-3 text-[var(--nim-text)]">Release Channel</h4>
         <p className="text-sm leading-relaxed text-[var(--nim-text-muted)] mb-4">
@@ -453,6 +456,7 @@ export function AdvancedPanel() {
           </div>
         )}
       </div>
+      )}
 
       {/* ── General ── */}
       <div className="provider-panel-section py-4 mb-4 border-b border-[var(--nim-border)] last:border-b-0 last:mb-0 last:pb-0">

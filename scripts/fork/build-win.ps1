@@ -85,7 +85,7 @@ if ($LASTEXITCODE -ne 0) { Fail 'node is not on PATH' }
 $nodeParsed = [version]($nodeVersion.TrimStart('v'))
 if ($nodeParsed.Major -ne 24) { Fail "Node 24 is required (found $nodeVersion)" }
 if ($nodeParsed.Minor -ge 19) {
-  Write-Warning "Node $nodeVersion: 24.19+ has crashed in native-addon GC on this machine. If the build dies in native code, use 24.18.1."
+  Write-Warning "Node ${nodeVersion}: 24.19+ has crashed in native-addon GC on this machine. If the build dies in native code, use 24.18.1."
 }
 $pnpmVersion = (pnpm --version).Trim()
 if ($LASTEXITCODE -ne 0) { Fail 'pnpm is not runnable (corepack enable; see FORK.md)' }

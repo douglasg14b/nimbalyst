@@ -37,6 +37,10 @@
 .PARAMETER IgnoreEnvOverrides
   Continue even if a data-redirecting environment variable is set at User or
   Machine scope.
+
+.PARAMETER DryRun
+  Read-only rehearsal: run every check and report what would happen, without
+  stopping at a running Nimbalyst, copying anything, or installing.
 #>
 [CmdletBinding()]
 param(
@@ -44,7 +48,8 @@ param(
   [string]$BackupRoot = (Join-Path $env:USERPROFILE 'NimbalystBackups'),
   [switch]$Interactive,
   [switch]$BackupOnly,
-  [switch]$IgnoreEnvOverrides
+  [switch]$IgnoreEnvOverrides,
+  [switch]$DryRun
 )
 
 Set-StrictMode -Version Latest
@@ -52,6 +57,22 @@ $ErrorActionPreference = 'Stop'
 
 function Write-Step([string]$Message) { Write-Host "`n==> $Message" -ForegroundColor Cyan }
 function Stop-Install([string]$Message) { Write-Host "`nSTOPPED: $Message" -ForegroundColor Red; exit 1 }
+# In a dry run a failed check is reported and the rehearsal continues.
+$script:DryRunFindings = @()
+function Stop-Check([string]$Message) {
+  if ($DryRun) {
+    Write-Host "  WOULD STOP: $Message" -ForegroundColor Yellow
+    $script:DryRunFindings += $Message
+  } else {
+    Stop-Install $Message
+  }
+}
+function Get-Prop($Object, [string]$Name) {
+  if ($null -eq $Object) { return $null }
+  $p = $Object.PSObject.Properties[$Name]
+  if ($p) { return $p.Value }
+  return $null
+}
 function Format-Size([double]$Bytes) { '{0:N2} GB' -f ($Bytes / 1GB) }
 
 function ConvertTo-PlainVersion([string]$Value) {
@@ -75,9 +96,10 @@ $running = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
 if ($running.Count -gt 0) {
   Write-Host 'These Nimbalyst processes are running:' -ForegroundColor Yellow
   $running | Sort-Object Id | Format-Table Id, ProcessName, Path -AutoSize | Out-String | Write-Host
-  Stop-Install 'Quit Nimbalyst (File > Quit, and check the system tray), then run this script again. Nothing was changed.'
+  Stop-Check 'Quit Nimbalyst (File > Quit, and check the system tray), then run this script again. Nothing was changed.'
+} else {
+  Write-Host '  No Nimbalyst process is running.'
 }
-Write-Host '  No Nimbalyst process is running.'
 
 # --- Persistent overrides that would point the app at other data -------------
 Write-Step 'Checking for data-redirecting environment variables'
@@ -91,7 +113,7 @@ $overrides = foreach ($scope in 'User', 'Machine', 'Process') {
 if ($overrides) {
   $overrides | Format-Table -AutoSize | Out-String | Write-Host
   if (-not $IgnoreEnvOverrides) {
-    Stop-Install 'these variables make Nimbalyst use different data or behave as a test build. Remove them, or pass -IgnoreEnvOverrides.'
+    Stop-Check 'these variables make Nimbalyst use different data or behave as a test build. Remove them, or pass -IgnoreEnvOverrides.'
   }
   Write-Warning 'Continuing with the overrides above (-IgnoreEnvOverrides).'
 } else {
@@ -103,23 +125,33 @@ Write-Step 'Locating the fork installer'
 $lastBuildPath = Join-Path $RepoRoot 'nimbalyst-local\fork-build\last-build.json'
 $lastBuild = $null
 if (Test-Path $lastBuildPath) { $lastBuild = Get-Content $lastBuildPath -Raw | ConvertFrom-Json }
+$installerHash = $null
+$forkCommit = '(unknown)'
+$forkVersion = $null
+if (-not $Installer -and $lastBuild) { $Installer = $lastBuild.installer }
 if (-not $Installer) {
-  if (-not $lastBuild) { Stop-Install "no -Installer given and no $lastBuildPath. Run scripts\fork\build-win.ps1 first." }
-  $Installer = $lastBuild.installer
+  Stop-Check "no -Installer given and no $lastBuildPath. Run scripts\fork\build-win.ps1 first."
+} elseif (-not (Test-Path $Installer)) {
+  Stop-Check "installer not found: $Installer"
+} else {
+  $Installer = (Resolve-Path $Installer).Path
+  $installerHash = (Get-FileHash $Installer -Algorithm SHA256).Hash
+  if (-not $lastBuild -or $lastBuild.installer -ne $Installer) {
+    Stop-Check 'the installer is not the one recorded by scripts\fork\build-win.ps1, so its fork version is unknown. Rebuild, or point -Installer at the recorded file.'
+  } elseif ($lastBuild.sha256 -ne $installerHash) {
+    Stop-Check "installer SHA-256 $installerHash does not match the build record $($lastBuild.sha256). Rebuild it."
+  } else {
+    $forkCommit = $lastBuild.commit
+    $forkVersion = ConvertTo-PlainVersion $lastBuild.upstreamVersion
+  }
 }
-if (-not (Test-Path $Installer)) { Stop-Install "installer not found: $Installer" }
-$Installer = (Resolve-Path $Installer).Path
-$installerHash = (Get-FileHash $Installer -Algorithm SHA256).Hash
-if ($lastBuild -and $lastBuild.installer -eq $Installer -and $lastBuild.sha256 -ne $installerHash) {
-  Stop-Install "installer SHA-256 $installerHash does not match the build record $($lastBuild.sha256). Rebuild it."
+if (-not $forkVersion) {
+  # Dry run without a usable build record: compare against the checkout's version.
+  $forkVersion = ConvertTo-PlainVersion ((Get-Content (Join-Path $RepoRoot 'packages\electron\package.json') -Raw | ConvertFrom-Json).version)
 }
-if (-not $lastBuild -or $lastBuild.installer -ne $Installer) {
-  Stop-Install 'the installer is not the one recorded by scripts\fork\build-win.ps1, so its fork version is unknown. Rebuild, or point -Installer at the recorded file.'
-}
-$forkVersion = ConvertTo-PlainVersion $lastBuild.upstreamVersion
-Write-Host "  $Installer"
-Write-Host "  SHA-256 $installerHash"
-Write-Host "  Fork commit $($lastBuild.commit), upstream version $forkVersion"
+Write-Host "  Installer: $Installer"
+Write-Host "  SHA-256:   $installerHash"
+Write-Host "  Fork commit $forkCommit, upstream version $forkVersion"
 
 # --- Current install, for the record and for rollback ------------------------
 Write-Step 'Recording the current install'
@@ -132,34 +164,39 @@ if (Test-Path $installedMarkerPath) { $installedMarker = Get-Content $installedM
 $installedSignature = Get-AuthenticodeSignature $InstalledExe
 $installedSigner = if ($installedSignature.SignerCertificate) { $installedSignature.SignerCertificate.Subject } else { '(unsigned)' }
 $uninstallKey = Get-ChildItem 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall' -ErrorAction SilentlyContinue |
-  Where-Object { (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).DisplayName -like 'Nimbalyst*' } |
+  Where-Object { "$(Get-Prop (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue) 'DisplayName')" -like 'Nimbalyst*' } |
   Select-Object -First 1
 $uninstallInfo = if ($uninstallKey) { Get-ItemProperty $uninstallKey.PSPath } else { $null }
 
 Write-Host "  Exe:       $InstalledExe"
 Write-Host "  Version:   $installedProductVersion"
 Write-Host "  Signer:    $installedSigner"
-if ($installedMarker) { Write-Host "  Fork build: commit $($installedMarker.commit)" } else { Write-Host '  Fork build: no (official build)' }
-if ($uninstallInfo) { Write-Host "  Registered: $($uninstallInfo.DisplayName) $($uninstallInfo.DisplayVersion) at $($uninstallInfo.InstallLocation)" }
+if ($installedMarker) { Write-Host "  Fork build: commit $(Get-Prop $installedMarker 'commit')" } else { Write-Host '  Fork build: no (official build)' }
+if ($uninstallInfo) {
+  Write-Host "  Registered: $(Get-Prop $uninstallInfo 'DisplayName') $(Get-Prop $uninstallInfo 'DisplayVersion') at $(Get-Prop $uninstallInfo 'InstallLocation')"
+  Write-Host "  Uninstall key: $($uninstallKey.Name)"
+} else {
+  Write-Warning 'No Nimbalyst entry under HKCU Uninstall; the installer may not treat this as an upgrade.'
+}
 
 # --- No downgrades -----------------------------------------------------------
 Write-Step 'Checking versions'
 $lastKnownVersion = $null
 $appSettingsPath = Join-Path $DataDir 'app-settings.json'
 if (Test-Path $appSettingsPath) {
-  $lastKnownVersion = ConvertTo-PlainVersion ((Get-Content $appSettingsPath -Raw | ConvertFrom-Json).lastKnownVersion)
+  $lastKnownVersion = ConvertTo-PlainVersion "$(Get-Prop (Get-Content $appSettingsPath -Raw | ConvertFrom-Json) 'lastKnownVersion')"
 }
 Write-Host "  Installed $installedVersion, data last opened by $lastKnownVersion, fork $forkVersion"
 if ($installedVersion -and $installedVersion -gt $forkVersion) {
-  Stop-Install "the installed Nimbalyst ($installedVersion) is newer than the fork ($forkVersion). Merge that release into fork/main and rebuild first; installing would be a downgrade."
+  Stop-Check "the installed Nimbalyst ($installedVersion) is newer than the fork ($forkVersion). Merge that release into fork/main and rebuild first; installing would be a downgrade."
 }
 if ($lastKnownVersion -and $lastKnownVersion -gt $forkVersion) {
-  Stop-Install "your data was last opened by Nimbalyst $lastKnownVersion, newer than the fork ($forkVersion). Merge that release into fork/main and rebuild first."
+  Stop-Check "your data was last opened by Nimbalyst $lastKnownVersion, newer than the fork ($forkVersion). Merge that release into fork/main and rebuild first."
 }
 $pendingInfoPath = Join-Path $UpdaterCache 'pending\update-info.json'
 if (Test-Path $pendingInfoPath) {
   $pending = Get-Content $pendingInfoPath -Raw | ConvertFrom-Json
-  Write-Host "  Official updater cache holds $($pending.fileName). The fork never reads it."
+  Write-Host "  Official updater cache holds $(Get-Prop $pending 'fileName'). The fork never reads it."
 }
 
 # --- Backup ------------------------------------------------------------------
@@ -189,13 +226,30 @@ Write-Host "  Source:  $DataDir"
 Write-Host "  Size:    $(Format-Size $sourceBytes) in $($sourceFiles.Count) files (excluding regenerable caches)"
 Write-Host "  Target:  $BackupData"
 Write-Host "  Free on $drive $(Format-Size $free)"
-if ($free -lt ($sourceBytes * 1.1 + 2GB)) { Stop-Install 'not enough free disk space for the backup' }
+if ($free -lt ($sourceBytes * 1.1 + 2GB)) { Stop-Check 'not enough free disk space for the backup' }
+
+if ($DryRun) {
+  Write-Host "`nDRY RUN complete. Nothing was copied, installed or changed." -ForegroundColor Green
+  if ($script:DryRunFindings.Count) {
+    Write-Host 'A real run would stop on:' -ForegroundColor Yellow
+    $script:DryRunFindings | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow }
+  } else {
+    Write-Host 'A real run would continue to the backup and install.'
+  }
+  exit 0
+}
 
 New-Item -ItemType Directory -Force $BackupData | Out-Null
-$excludeDirs = $CacheDirs + @('Dawn*')
+# Exclude only the top-level cache folders, by full path; a bare name would also
+# exclude same-named folders at any depth (e.g. "Shared Dictionary\cache") and
+# break the file-count check below.
+$excludeDirs = @(Get-ChildItem -LiteralPath $DataDir -Directory -Force | Where-Object {
+    ($CacheDirs -contains $_.Name) -or ($_.Name -like 'Dawn*')
+  } | ForEach-Object { $_.FullName })
 # robocopy only reads the source. /E all subfolders, /COPY:DAT data+attributes+timestamps,
 # /DCOPY:T folder timestamps, /XJ skip junctions, /R:2 /W:2 short retries.
-$robocopyArgs = @($DataDir, $BackupData, '/E', '/COPY:DAT', '/DCOPY:T', '/XJ', '/R:2', '/W:2', '/NP', '/NFL', '/NDL', '/XD') + $excludeDirs
+$robocopyArgs = @($DataDir, $BackupData, '/E', '/COPY:DAT', '/DCOPY:T', '/XJ', '/R:2', '/W:2', '/NP', '/NFL', '/NDL')
+if ($excludeDirs.Count) { $robocopyArgs += @('/XD') + $excludeDirs }
 & robocopy @robocopyArgs | Out-Host
 if ($LASTEXITCODE -ge 8) { Stop-Install "robocopy failed with exit code $LASTEXITCODE. The install did not run." }
 

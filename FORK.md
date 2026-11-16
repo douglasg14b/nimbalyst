@@ -1,124 +1,152 @@
 # Nimbalyst fork
 
-This is a personal fork of [nimbalyst/nimbalyst](https://github.com/nimbalyst/nimbalyst) (MIT). The fork build replaces the official install on one Windows machine and is updated only from this fork, never by the official updater.
+This is a personal fork of [nimbalyst/nimbalyst](https://github.com/nimbalyst/nimbalyst) (MIT). The fork build replaces the official install and is updated only from this fork, never by the official updater. The scripts are Node, so nothing ties them to one OS; only Windows is implemented so far (see [Other operating systems](#other-operating-systems)).
+
+## Day-to-day commands
+
+All from the fork checkout, on `fork/main`:
+
+| Task | Command |
+| --- | --- |
+| Update to the newest stable upstream release, build, smoke-test | `node scripts/fork/update.mjs` |
+| Only merge the newest upstream release | `node scripts/fork/sync-upstream.mjs` |
+| Build the installer | `node scripts/fork/build.mjs` |
+| Boot the build on an empty scratch profile | `node scripts/fork/smoke-test.mjs` |
+| Rehearse the install (read-only, safe while Nimbalyst runs) | `node scripts/fork/install.mjs --dry-run` |
+| Install (Nimbalyst closed, normal terminal) | `node scripts/fork/install.mjs` |
+| Push | `git push origin main fork/main` |
+
+Every script takes `--help`.
+
+## How you learn about updates
+
+The installed fork build never downloads or installs anything. Twice a day (first check one minute after launch) it asks GitHub two questions:
+
+- Has upstream published a **stable** release newer than the version this build is based on?
+- Does this fork's `fork/main` have commits the installed build does not contain (for example, changes you pushed from another machine)?
+
+If either answer is yes, it shows one Windows notification per new state ("Nimbalyst fork: update available"); clicking it opens the details. **Help > Check for Updates...** shows the same status on demand, plus the fork commit and the commands. Nothing happens to the app until you run `update.mjs` and `install.mjs`.
+
+Pulling or fetching in the checkout changes nothing in the installed app either; only `build.mjs` + `install.mjs` do.
 
 ## What differs from upstream
 
-| Area | Change | Where |
-| --- | --- | --- |
-| Updater | In fork builds the electron-updater singleton is never constructed; an inert stub takes its place, so nothing checks, downloads or installs from `nimbalyst/nimbalyst`. That covers the startup and hourly checks, both "Check for Updates..." menu items, the `check-for-updates` / `download-update` / `quit-and-install` IPC, the `update-toast:*` handlers, `release-channel:set`, install-on-quit, and the cached installer in `%LOCALAPPDATA%\@nimbalystelectron-updater`. | `packages/electron/src/main/services/autoUpdater.ts`, `forkInertUpdater.ts` |
-| Check for Updates... | Shows a dialog naming the fork commit and pointing at these scripts. | `autoUpdater.ts` (`checkForUpdatesWithUI`) |
-| Settings > Advanced | The Release Channel section is replaced by a "Fork build" section showing the fork commit. | `AdvancedPanel.tsx`, `ForkBuildSection.tsx` |
-| Build flag | `NIMBALYST_FORK_BUILD` and `NIMBALYST_FORK_COMMIT` are compiled in with `define`, the same way as `OFFICIAL_BUILD`. Upstream builds compile them to off. | `electron.vite.config.ts`, `src/shared/forkBuild.ts` |
-| Packaging | Fork builds add `resources\fork-build.json` (the on-disk marker) and point `publish`, and therefore `resources\app-update.yml`, at this fork. | `scripts/fork/electron-builder.fork.cjs` |
-| Windows build fix | `normalize-extra-resources.js` creates a directory junction instead of a symlink on Windows, so the build works without Developer Mode or admin rights. | `packages/electron/build/normalize-extra-resources.js` |
+The fork's footprint in upstream files is kept to a few one-line hooks. Everything else is in new files, which cannot conflict.
 
-Unchanged on purpose: `appId` `com.nimbalyst.electron`, `productName` `Nimbalyst`, package name `@nimbalyst/electron`, the NSIS options, the AppUserModelId and the version. The fork therefore installs into `%LOCALAPPDATA%\Programs\Nimbalyst`, keeps the shortcuts, the `nimbalyst://` protocol, the `.md` association and the notification identity, and uses the existing data in `%APPDATA%\@nimbalyst\electron`.
+| Upstream file touched | Change |
+| --- | --- |
+| `packages/electron/src/main/services/autoUpdater.ts` | Binds an inert stub instead of electron-updater's lazily created singleton when the fork flag is set, and short-circuits the feed setup, polling, cache cleanup, quit-and-install and "Check for Updates..." paths. |
+| `packages/electron/electron.vite.config.ts` | Compiles in `NIMBALYST_FORK_BUILD`, `NIMBALYST_FORK_COMMIT` and `NIMBALYST_FORK_REPO` next to `OFFICIAL_BUILD`. Upstream builds compile them to off. |
+| `packages/electron/src/renderer/components/GlobalSettings/panels/AdvancedPanel.tsx` | Shows a "Fork build" section (with the commit) instead of the Release Channel section. |
+| `packages/electron/build/normalize-extra-resources.js` | Windows build fix: a directory junction instead of a symlink, so the build works without Developer Mode or admin. Worth offering upstream. |
 
-The regression test is `packages/electron/src/main/services/__tests__/autoUpdater.forkBuild.test.ts`. It fails if any trigger reaches the real electron-updater while the fork flag is set.
+New, fork-only files: `src/shared/forkBuild.ts`, `src/main/services/forkInertUpdater.ts`, `forkUpdateNotice.ts`, `forkUpdateStatus.ts`, `ForkBuildSection.tsx`, their tests, `scripts/fork/`, and this file.
+
+With the flag set, nothing can check, download or install from `nimbalyst/nimbalyst`: the startup and hourly checks, both "Check for Updates..." menu items, the `check-for-updates` / `download-update` / `quit-and-install` IPC, the `update-toast:*` handlers, `release-channel:set`, install-on-quit, and the cached installer in the official updater's cache folder all land on the stub. `resources/app-update.yml` names this fork instead of the official feed as a second line of defence.
+
+Unchanged on purpose: `appId` `com.nimbalyst.electron`, `productName` `Nimbalyst`, package name `@nimbalyst/electron`, the installer options, the AppUserModelId and the version. So the fork installs over the official app in place and uses the same data folder (`%APPDATA%\@nimbalyst\electron` on Windows).
+
+Tests that guard the fork: `autoUpdater.forkBuild.test.ts` (fails if any trigger reaches the real updater with the flag set) and `forkUpdateStatus.test.ts` (the notice's decisions). `sync-upstream.mjs` runs both after every merge.
 
 ## Version
 
-The fork keeps the upstream version unchanged (for example `0.83.0`). Fork identity lives in the commit SHA, which is compiled in, shown in Settings and the update dialog, and written to `resources\fork-build.json`.
+The fork keeps the upstream version unchanged (for example `0.83.0`). Fork identity is the commit SHA: compiled in, shown in Settings and the update dialog, and written to `resources/fork-build.json`.
 
 Why not a suffix:
 
 - `0.83.0-fork.1` is a semver prerelease, which sorts *below* `0.83.0`.
-- `0.83.0+fork.1` is build metadata: semver ignores it, but it is a different string. The app's settings migrations run whenever `lastKnownVersion !== app.getVersion()` (`runMigrations` in `src/main/utils/store.ts`), so every fork rebuild and every rollback would rewrite `app-settings.json`.
+- `0.83.0+fork.1` is build metadata: semver ignores it, but it is a different string. The app's settings migrations run whenever `lastKnownVersion !== app.getVersion()` (`runMigrations` in `src/main/utils/store.ts`), so every rebuild and every rollback would rewrite `app-settings.json`.
 - Changing `"version"` in `packages/electron/package.json` conflicts on every upstream release merge.
 
-With the version unchanged, versions only go up, exactly as upstream releases do, as long as fork/main only ever merges release tags.
+Merging only release tags keeps versions moving forward exactly as upstream's do.
 
 ## Branches
 
 | Branch | Purpose |
 | --- | --- |
-| `main` | Exact mirror of `upstream/main`. Never commit to it. |
-| `fork/main` | What gets built and installed. Cut from the `v0.83.0` tag, and only ever merges upstream **release tags** (`v0.83.1`, ...), never `upstream/main`, plus the topic branches below. |
-| `fork/self-managed-install` | This file, the fork flag, and the build and install scripts. Fork-only. |
+| `main` | Exact mirror of `upstream/main`. Never commit to it; `sync-upstream.mjs` fast-forwards it. |
+| `fork/main` | What gets built and installed. Cut from the `v0.83.0` tag. Takes upstream **release tags** only (never `upstream/main`), plus the topic branches below. |
+| `fork/self-managed-install` | The fork flag, update notice, scripts and this file. Fork-only. |
 | `fork/worktree-auto-commit` | Setting to auto-approve commits into other worktrees. Kept clean for an upstream PR. |
 | `fork/remote-control` | Claude Code Remote Control in SDK sessions. Kept clean for an upstream PR. |
 
-Integrate with merge, never rebase. Commits on the two feature branches carry a DCO sign-off (`git commit -s`).
+Integrate with merge, never rebase. Feature-branch commits carry a DCO sign-off (`git commit -s`).
 
-## Syncing with upstream
+## Updating to a new upstream release
 
-```powershell
-git fetch upstream --tags
-git switch main;  git merge --ff-only upstream/main          # keep the mirror exact
-git switch fork/main
-git merge --no-ff v0.84.0                                    # a release tag, not upstream/main
-# Merge upstream into each topic branch too if it conflicts, then re-merge the topic into fork/main.
-pnpm install --frozen-lockfile
-pnpm typecheck
+```
+node scripts/fork/update.mjs
 ```
 
-Only merge a tag whose GitHub release is **not** marked prerelease. Alpha tags such as `v0.84.0` (a prerelease when this was written) can carry migrations that the next stable release changes.
+It runs `sync-upstream.mjs` (fetch, fast-forward `main`, merge the newest stable release tag into `fork/main`, `pnpm install`, the fork's tests), then `build.mjs` and `smoke-test.mjs`, and finally tells you to push, quit Nimbalyst and run `install.mjs`. Prerelease tags (alpha builds such as `v0.84.0` when this was written) are never picked; `--tag vX.Y.Z` overrides the choice.
+
+### Resolving conflicts
+
+If the merge stops, the script lists the conflicted files and leaves the merge in progress. Conflicts can only come from the four upstream files in the table above. For each one:
+
+1. Take upstream's version of the code (`git checkout --theirs <file>` takes it wholesale).
+2. Re-apply the fork's hook: in `autoUpdater.ts`, the `const autoUpdater = isForkBuild() ? createInertUpdater() : electronAutoUpdater;` binding, the imports, and each `if (isForkBuild())` early return (`git show fork/self-managed-install:<file>` shows the fork's version); in the others, the few marked lines.
+3. `git add <file>`, then `git commit` to finish the merge, and re-run `node scripts/fork/update.mjs`. The fork's tests fail if a hook was lost.
+
+`git merge --abort` undoes the attempt.
+
+Regenerated build output (third-party license files, `packages/collab-bundle/types`) is reset to the committed version before merging, never committed on fork branches, and does not count as an uncommitted change.
 
 ## Building
 
-From a normal PowerShell window in the fork checkout, on `fork/main` with a clean tree:
+`node scripts/fork/build.mjs` runs the steps from `.github/workflows/electron-build.yml` for the platform (tracker packages, extension-sdk, runtime, the three extensions, then the electron-builder script with `--publish never`) at below-normal CPU priority. It sets the fork flag, clears `OFFICIAL_BUILD`, `CI` and every signing variable, and leaves the build unsigned. It stops on the first failing step, then checks that the installer is newer than the run, that `app.asar` carries the fork commit, that the marker matches HEAD and that `app-update.yml` no longer names the official feed. The result (path, SHA-256, commit) goes to `nimbalyst-local/fork-build/last-build.json`, which the other scripts read.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\fork\build-win.ps1
-```
+Output goes outside the checkout (`%LOCALAPPDATA%\NimbalystForkBuild\release` on Windows): while Nimbalyst has this repo open it locks `.asar` files under `packages/electron/release`, and electron-builder then fails with EPERM or EBUSY.
 
-The script runs the Windows x64 steps from `.github/workflows/electron-build.yml` (tracker packages, extension-sdk, runtime, the three extensions, then `build:win --publish never`) at below-normal CPU priority. It sets the fork flag, clears `OFFICIAL_BUILD`, `CI` and every signing variable, and leaves the build unsigned. It checks that the installer is newer than the run, that `app.asar` carries the fork commit, that the marker matches HEAD, and that `app-update.yml` no longer names the official feed. Then it prints the installer path and SHA-256 and records them in `nimbalyst-local\fork-build\last-build.json`.
-
-Output goes to `%LOCALAPPDATA%\NimbalystForkBuild\release`, outside the checkout: while Nimbalyst has this repo open it locks `.asar` files under `packages\electron\release`, and electron-builder then fails with EPERM or EBUSY.
-
-Then boot the build once on an empty scratch profile (never your real data):
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\fork\smoke-test.ps1
-```
-
-It can run beside a running Nimbalyst. It checks that the app reaches "App ready", that the log shows the inert updater with the expected commit and no update check, and that SQLite initialises. It saves and restores the `nimbalyst://` registration, which a packaged launch re-points at the test exe, and closes only the test build's processes.
+`node scripts/fork/smoke-test.mjs` then boots the build on a new, empty profile (never your data), even beside a running Nimbalyst. It checks "App ready", the inert-updater log line with the expected commit, no official update check, SQLite initialisation, and that nothing was logged into your real data folder. It saves and restores the `nimbalyst://` registration, which a packaged launch re-points at the test exe, and closes only the test build's processes.
 
 Prerequisites, not all documented upstream:
 
-- Node 24 and pnpm 12.9.1 via corepack. Corepack older than 0.36 fails to start pnpm 12 (`Cannot find module ...\pnpm\12.9.1\bin\pnpm.cjs`); run `npm i -g corepack@latest`, and if the cached `.corepack` file still lists `pnpm.cjs`, delete `%LOCALAPPDATA%\node\corepack\v1\pnpm\12.9.1` and let it download again.
-- Node 24.19+ has crashed in native-addon GC on this machine. If the build dies in native code, use 24.18.1.
+- Node 24 and pnpm 12.9.1 via corepack. Corepack older than 0.36 fails to start pnpm 12 (`Cannot find module ...\pnpm\12.9.1\bin\pnpm.cjs`); run `npm i -g corepack@latest`, and if the cached `.corepack` file still lists `pnpm.cjs`, delete the cached `pnpm\12.9.1` folder and let it download again.
+- Node 24.19+ has crashed in native-addon GC on one machine. If the build dies in native code, use 24.18.1.
 - No signing setup. `build/sign-windows.js` skips signing when DigiCert is not configured and `CI` is not `true`.
 
 ## Installing
 
-Quit Nimbalyst first, including the tray icon. Then, from a normal PowerShell window (not inside Nimbalyst):
+Quit Nimbalyst first, including the tray icon; running sessions stop, and their history stays in the database. Then, from a normal terminal (not inside Nimbalyst):
 
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\fork\install.ps1
+```
+node scripts/fork/install.mjs
 ```
 
-The script:
+It:
 
-1. Refuses to run while any Nimbalyst process exists, and lists them. It never stops them.
-2. Refuses if a data-redirecting variable (`NIMBALYST_USER_DATA_DIR`, `NIMBALYST_USER_DATA_PATH`, `RUN_ONE_DEV_MODE`, `PLAYWRIGHT`, `ELECTRON_RUN_AS_NODE`) is set at User, Machine or Process scope.
-3. Refuses a downgrade: neither the installed version nor `lastKnownVersion` in `app-settings.json` may be newer than the fork's upstream version. This matters because the official updater can install a pending update the moment the official app quits.
-4. Copies `%APPDATA%\@nimbalyst\electron` to `%USERPROFILE%\NimbalystBackups\nimbalyst-<timestamp>\electron` with robocopy, skipping only `Cache`, `Code Cache`, `GPUCache` and `Dawn*`. It checks free space first, prints the size, and verifies the file count and byte total afterwards. The live data is only read.
-5. Saves rollback material in the same folder: `rollback-info.json` (installed version, exe path, signer), the signed official installer from the updater cache when it matches the installed version, and registry exports of the `nimbalyst://` handler and the uninstall entry.
-6. Runs the fork installer with `/S /currentuser`. This is the NSIS upgrade path an official update uses: the installer runs the previous uninstaller with `/S /KEEP_APP_DATA --updated`, which removes only the program folder, and keeps the shortcuts. App data is deleted only with `--delete-app-data` or `deleteAppDataOnUninstall`, and neither is used.
-7. Verifies the installed exe version, the fork marker and commit, the fork flag in `app.asar`, `app-update.yml`, and that no file in the data folder changed size or timestamp during the install.
+1. Refuses while any Nimbalyst process exists, and lists them. It never stops them.
+2. Refuses if a data-redirecting variable (`NIMBALYST_USER_DATA_DIR`, `NIMBALYST_USER_DATA_PATH`, `RUN_ONE_DEV_MODE`, `PLAYWRIGHT`, `ELECTRON_RUN_AS_NODE`) is set for the process, the user or the machine.
+3. Refuses a downgrade: neither the installed version nor `lastKnownVersion` in `app-settings.json` may be newer than the fork's upstream version. (The official updater can install a pending update the moment the official app quits.)
+4. Copies the data folder to `~/NimbalystBackups/nimbalyst-<timestamp>/`, skipping only `Cache`, `Code Cache`, `GPUCache` and `Dawn*`. It checks free space first, prints the size, and verifies the file count and byte total afterwards. The live data is only read.
+5. Saves rollback material in the same folder: `rollback-info.json`, the signed official installer from the updater cache when it matches the installed version, and exports of the `nimbalyst://` handler and the uninstall entry.
+6. Runs the fork installer silently in per-user mode (`/S /currentuser`). This is the upgrade path an official update uses: the installer runs the previous uninstaller with `/S /KEEP_APP_DATA --updated`, which removes only the program folder and keeps the shortcuts. App data is deleted only with `--delete-app-data` or `deleteAppDataOnUninstall`, and neither is used.
+7. Verifies the installed version, the fork marker and commit, the fork flag in `app.asar`, `app-update.yml`, and that no data file changed size or timestamp during the install.
 
-`-BackupOnly` takes and verifies the backup without installing. `-Interactive` shows the normal installer UI.
+`--dry-run` runs every check and reports what a real run would stop on, without copying or installing; it is safe while Nimbalyst runs. `--backup-only` takes and verifies the backup without installing. `--interactive` shows the normal installer UI.
 
 ## Rolling back
 
 1. Quit Nimbalyst.
-2. Run the official installer for the version you had: the copy in the backup folder if the script saved one, otherwise the asset from the [GitHub release](https://github.com/nimbalyst/nimbalyst/releases) (`Nimbalyst-Windows-x64.exe`). It upgrades in place over the fork the same way, and keeps the data.
-3. The data does not need restoring. The fork reads and writes it in the same format as the upstream version it is based on, and the version string is unchanged, so not even the settings migrations run. Restore the backup only if something is actually missing: with Nimbalyst closed, copy `<backup>\electron` back over `%APPDATA%\@nimbalyst\electron`.
+2. Run the official installer for the version you had: the copy in the backup folder if one was saved, otherwise the asset from the [GitHub release](https://github.com/nimbalyst/nimbalyst/releases). It upgrades in place over the fork and keeps the data.
+3. The data does not need restoring. The fork reads and writes it in the same format as the upstream version it is based on, and the version string is unchanged, so not even the settings migrations run. Restore the backup only if something is actually missing: with Nimbalyst closed, copy the backed-up `electron` folder back over the data folder.
 
 After a rollback the official updater is active again and will offer newer official releases.
 
-## Updating later
+## Why not real auto-update from this fork
 
-Merge the next stable upstream release tag into `fork/main` (see Syncing), merge or re-merge the topic branches, then run `build-win.ps1` and `install.ps1`.
+The Windows updater verifies the installer's Authenticode signature against `NIMBALYST, INC.` (`src/main/services/windowsSignatureVerifier.ts`), and unsigned fork builds fail it. Making that work means either a code-signing certificate or accepting unsigned installers verified only by the hash in the release metadata, which lets anyone who controls the GitHub account push a self-installing update. It would also need a CI pipeline publishing releases and much more fork code in the updater. The notice plus `update.mjs` gives the same awareness with none of that.
 
-Pulling updates from GitHub Releases on this fork is not worth it. The Windows updater verifies the installer's Authenticode signature against `NIMBALYST, INC.` (`src/main/services/windowsSignatureVerifier.ts`), and unsigned fork builds fail it. Making that work means either a code-signing certificate or switching signature verification off, which is a security downgrade for an auto-installing updater. It would also need a CI pipeline to publish releases and a re-enabled updater, and the two scripts already do the job.
+## Other operating systems
+
+The scripts are platform-neutral; everything OS-specific (install and data paths, process listing, installer invocation, the `nimbalyst://` registration, signature checks) is in `scripts/fork/lib/win32.mjs`, behind the contract documented in `scripts/fork/lib/platform.mjs`. To add Linux (AppImage) or macOS, write a sibling `linux.mjs` / `darwin.mjs` with the same members and register it in `platform.mjs`; on an unsupported OS every script stops with "not supported yet". The app-side code (flag, inert updater, notice) is already OS-neutral, though the notice's wording and the electron-builder targets (`build:linux`, `build:mac:local`) need checking per platform.
 
 ## Known risks
 
-- **Official builds still work as before.** Running an official installer, by hand or from an old download, replaces the fork. That is the rollback path, not a bug.
-- **Analytics.** `OFFICIAL_BUILD` does not gate whether analytics are sent; the "Usage analytics" setting does. It only tags events: non-official builds mark the PostHog person `is_dev_user` (permanently, via `$set_once`) and stamp `build_type: local`. The fork leaves `OFFICIAL_BUILD` unset, so it does not pose as an official build. Nothing else, including sign-in, sync and mobile pairing, reads it. Turn analytics off in Settings if you do not want a fork build reporting to upstream's PostHog.
-- **Unsigned binaries.** SmartScreen may warn on first run of the installer, and Windows notifications still use the `com.nimbalyst.electron` identity.
+- **Official installers still work.** Running an official installer, by hand or from an old download, replaces the fork. That is the rollback path, not a bug.
+- **Analytics.** `OFFICIAL_BUILD` does not gate whether analytics are sent; the "Usage analytics" setting does. It only tags events: non-official builds mark the analytics person `is_dev_user` (permanently) and stamp `build_type: local`. The fork leaves `OFFICIAL_BUILD` unset, so it does not pose as an official build. Nothing else, including sign-in, sync and mobile pairing, reads it. Turn analytics off in Settings if you do not want a fork build reporting to upstream.
+- **Unsigned binaries.** SmartScreen may warn the first time the installer runs.
 - **Data migrations.** Merging a release brings its schema migrations, which run on first launch of the new build, exactly as with an official update. Rolling back across such a release is as unsafe as with official builds; restore the pre-install backup in that case.
-- **Prerelease tags.** Merging an alpha tag can apply migrations that a later stable release changes. Merge stable tags only.
+- **Prerelease tags.** Merging an alpha tag can apply migrations that a later stable release changes. `sync-upstream.mjs` only picks stable releases.
+- **Scratch-profile isolation (upstream behaviour).** With `NIMBALYST_USER_DATA_DIR` set, a few early startup log lines still go to the real `logs/main.log`, and the analytics service reads the real `analytics-settings.json` before the redirect applies. Read-only, but worth knowing when running test instances.

@@ -91,10 +91,11 @@ const optimizeExcalidrawPlugin = () => {
 
 const isDev = process.env.NODE_ENV !== 'production';
 const isOfficialBuild = process.env.OFFICIAL_BUILD === 'true';
-// Fork builds (FORK.md): set by scripts/fork/build-win.ps1, read through src/shared/forkBuild.ts.
+// Fork builds (FORK.md): set by scripts/fork/build.mjs, read through src/shared/forkBuild.ts.
 const forkBuildDefines = {
   'process.env.NIMBALYST_FORK_BUILD': JSON.stringify(process.env.NIMBALYST_FORK_BUILD === 'true' ? 'true' : 'false'),
   'process.env.NIMBALYST_FORK_COMMIT': JSON.stringify(process.env.NIMBALYST_FORK_COMMIT ?? ''),
+  'process.env.NIMBALYST_FORK_REPO': JSON.stringify(process.env.NIMBALYST_FORK_REPO ?? ''),
 };
 // IS_DEV_MODE is true only when running `npm run dev`, not for any packaged builds
 const isDevMode = isDev;

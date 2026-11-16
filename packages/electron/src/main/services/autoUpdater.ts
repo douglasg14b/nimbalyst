@@ -21,8 +21,9 @@ import {
 import { installAtomFeedFilter } from './electronUpdaterPatch';
 import { createWindowsSignatureVerifier } from './windowsSignatureVerifier';
 import type { NsisUpdater } from 'electron-updater';
-import { FORK_UPDATE_INSTRUCTIONS, getForkCommit, isForkBuild } from '../../shared/forkBuild';
+import { getForkCommit, isForkBuild } from '../../shared/forkBuild';
 import { createInertUpdater } from './forkInertUpdater';
+import { showForkUpdateDialog, startForkUpdateNotice } from './forkUpdateNotice';
 
 // Fork builds (FORK.md) never read electron-updater's lazily constructed
 // updater, so no feed, download or install-on-quit exists in them.
@@ -599,7 +600,8 @@ export class AutoUpdaterService {
       // to the default userData path until the app's logger is configured, so
       // a module-load line from a scratch-profile instance lands in the real log.
       log.info(`[fork] Fork build ${getForkCommit()}: the official updater is disabled (inert stub bound)`);
-      return; // Fork builds never poll.
+      startForkUpdateNotice(); // Notifies only; never downloads or installs.
+      return; // Fork builds never poll the official feed.
     }
     // Initial check after 30 seconds
     setTimeout(() => {
@@ -640,14 +642,7 @@ export class AutoUpdaterService {
 
   public async checkForUpdatesWithUI() {
     if (isForkBuild()) {
-      const options = {
-        type: 'info' as const,
-        title: 'Check for Updates',
-        message: 'This is a fork build of Nimbalyst.',
-        detail: `Fork commit ${getForkCommit()}.\n\n${FORK_UPDATE_INSTRUCTIONS}`,
-      };
-      const window = this.getFrontmostWindow();
-      await (window ? dialog.showMessageBox(window, options) : dialog.showMessageBox(options));
+      await showForkUpdateDialog(this.getFrontmostWindow());
       return;
     }
     if (this.isCheckingForUpdate) {

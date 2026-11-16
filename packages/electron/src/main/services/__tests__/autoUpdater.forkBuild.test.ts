@@ -50,6 +50,9 @@ vi.mock('electron', () => ({
   },
   BrowserWindow: { getFocusedWindow: () => null, getAllWindows: () => [] },
   dialog: { showMessageBox: vi.fn(async () => ({ response: 0 })) },
+  // The fork's update notice only reads GitHub; offline here, it must degrade quietly.
+  net: { fetch: vi.fn(async () => { throw new Error('offline in tests'); }) },
+  Notification: Object.assign(vi.fn(), { isSupported: () => false }),
 }));
 vi.mock('electron-log/main', () => ({
   default: { transports: { file: {} }, info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -125,7 +128,10 @@ describe('fork build updater', () => {
     expect(electron.dialog.showMessageBox).toHaveBeenCalledTimes(1);
     const options = vi.mocked(electron.dialog.showMessageBox).mock.calls[0].at(-1) as unknown as { detail: string };
     expect(options.detail).toContain('abc1234');
-    expect(options.detail).toContain('scripts/fork/install.ps1');
+    expect(options.detail).toContain('scripts/fork/update.mjs');
+    expect(options.detail).toContain('Could not reach GitHub');
+    // The notice checked GitHub (and failed quietly) but never touched the official updater.
+    expect(vi.mocked(electron.net.fetch)).toHaveBeenCalled();
   });
 
   it('constructs the real updater when the flag is not set (proves the mock bites)', async () => {

@@ -1,10 +1,10 @@
 /**
  * Fork build identity (see FORK.md at the repo root).
  *
- * `scripts/fork/build-win.ps1` sets NIMBALYST_FORK_BUILD=true and
- * NIMBALYST_FORK_COMMIT=<sha> at build time; electron.vite.config.ts injects
- * them into the main and renderer bundles with `define`, the same way
- * OFFICIAL_BUILD is injected. Upstream builds compile both to their "off"
+ * `scripts/fork/build.mjs` sets NIMBALYST_FORK_BUILD=true, NIMBALYST_FORK_COMMIT=<sha>
+ * and NIMBALYST_FORK_REPO=<owner>/<repo> at build time; electron.vite.config.ts
+ * injects them into the main and renderer bundles with `define`, the same way
+ * OFFICIAL_BUILD is injected. Upstream builds compile them to their "off"
  * values, so nothing here changes behavior outside the fork.
  *
  * These are functions, not constants, so unit tests can toggle the
@@ -19,6 +19,12 @@ export function getForkCommit(): string {
   return process.env.NIMBALYST_FORK_COMMIT || 'unknown';
 }
 
+/** "owner/repo" of the fork on GitHub, or '' when unknown. */
+export function getForkRepo(): string {
+  return process.env.NIMBALYST_FORK_REPO || '';
+}
+
 export const FORK_UPDATE_INSTRUCTIONS =
-  'This fork build does not update itself. To update, merge the next upstream release tag into fork/main, ' +
-  'then run scripts/fork/build-win.ps1 and scripts/fork/install.ps1 from the fork checkout. See FORK.md.';
+  'This fork build does not update itself. In the fork checkout, run `node scripts/fork/update.mjs` ' +
+  '(merges the newest upstream release into fork/main, builds and smoke-tests), then quit Nimbalyst and run ' +
+  '`node scripts/fork/install.mjs`. See FORK.md.';

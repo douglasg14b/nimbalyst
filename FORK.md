@@ -14,7 +14,9 @@ All from the fork checkout, on `fork/main`:
 | Boot the build on an empty scratch profile | `node scripts/fork/smoke-test.mjs` |
 | Rehearse the install (read-only, safe while Nimbalyst runs) | `node scripts/fork/install.mjs --dry-run` |
 | Install (Nimbalyst closed, normal terminal) | `node scripts/fork/install.mjs` |
-| Push | `git push origin main fork/main` |
+| Push `main` and `fork/main` to your fork | `node scripts/fork/push.mjs` |
+| Publish the smoke-tested build as a GitHub Release on your fork | `node scripts/fork/release.mjs` |
+| Have an agent do the whole update and publish | `/fork-update` in a Claude Code or Nimbalyst session |
 
 Every script takes `--help`.
 
@@ -40,13 +42,13 @@ The fork's footprint in upstream files is kept to a few one-line hooks. Everythi
 | `packages/electron/src/renderer/components/GlobalSettings/panels/AdvancedPanel.tsx` | Shows a "Fork build" section (with the commit) instead of the Release Channel section. |
 | `packages/electron/build/normalize-extra-resources.js` | Windows build fix: a directory junction instead of a symlink, so the build works without Developer Mode or admin. Worth offering upstream. |
 
-New, fork-only files: `src/shared/forkBuild.ts`, `src/main/services/forkInertUpdater.ts`, `forkUpdateNotice.ts`, `forkUpdateStatus.ts`, `ForkBuildSection.tsx`, their tests, `scripts/fork/`, and this file.
+New, fork-only files: `src/shared/forkBuild.ts`, `src/main/services/forkInertUpdater.ts`, `forkUpdateNotice.ts`, `forkUpdateStatus.ts`, `ForkBuildSection.tsx`, their tests, `scripts/fork/`, `.claude/commands/fork-update.md`, and this file.
 
 With the flag set, nothing can check, download or install from `nimbalyst/nimbalyst`: the startup and hourly checks, both "Check for Updates..." menu items, the `check-for-updates` / `download-update` / `quit-and-install` IPC, the `update-toast:*` handlers, `release-channel:set`, install-on-quit, and the cached installer in the official updater's cache folder all land on the stub. `resources/app-update.yml` names this fork instead of the official feed as a second line of defence.
 
 Unchanged on purpose: `appId` `com.nimbalyst.electron`, `productName` `Nimbalyst`, package name `@nimbalyst/electron`, the installer options, the AppUserModelId and the version. So the fork installs over the official app in place and uses the same data folder (`%APPDATA%\@nimbalyst\electron` on Windows).
 
-Tests that guard the fork: `autoUpdater.forkBuild.test.ts` (fails if any trigger reaches the real updater with the flag set) and `forkUpdateStatus.test.ts` (the notice's decisions). `sync-upstream.mjs` runs both after every merge.
+Tests that guard the fork: `autoUpdater.forkBuild.test.ts` (fails if any trigger reaches the real updater with the flag set) and `forkUpdateStatus.test.ts` (the notice's decisions). `sync-upstream.mjs` runs both, plus the full typecheck, after every merge, including a merge finished by hand after conflicts. `update.mjs` runs them before any other build.
 
 ## Version
 
@@ -78,15 +80,19 @@ Integrate with merge, never rebase. Feature-branch commits carry a DCO sign-off 
 node scripts/fork/update.mjs
 ```
 
-It runs `sync-upstream.mjs` (fetch, fast-forward `main`, merge the newest stable release tag into `fork/main`, `pnpm install`, the fork's tests), then `build.mjs` and `smoke-test.mjs`, and finally tells you to push, quit Nimbalyst and run `install.mjs`. Prerelease tags (alpha builds such as `v0.84.0` when this was written) are never picked; `--tag vX.Y.Z` overrides the choice.
+It runs `sync-upstream.mjs` (fetch, fast-forward `main`, merge the newest stable release tag into `fork/main`, `pnpm install`, the fork's tests, the typecheck), then `build.mjs` and `smoke-test.mjs`, and finally tells you to push, publish if you want, quit Nimbalyst and run `install.mjs`. Prerelease tags (alpha builds such as `v0.84.0` when this was written) are never picked; `--tag vX.Y.Z` overrides the choice.
+
+### With an agent
+
+`/fork-update` ([.claude/commands/fork-update.md](.claude/commands/fork-update.md)) has an agent do the same, end to end. It merges, resolves conflicts in the hooked files listed above (and stops on any other conflict), builds, smoke-tests, pushes with `push.mjs`, publishes with `release.mjs`, and reports. If there is no new stable upstream release, it stops at once. `/fork-update force` publishes the current `fork/main` anyway, and `no-release` skips publishing. The agent never installs and never stops Nimbalyst, so it can run inside Nimbalyst; installing stays your step.
 
 ### Resolving conflicts
 
-If the merge stops, the script lists the conflicted files and leaves the merge in progress. Conflicts can only come from the four upstream files in the table above. For each one:
+If the merge stops, the script lists the conflicted files and leaves the merge in progress. Conflicts from the fork can only be in the upstream files in the table above. For each one:
 
-1. Take upstream's version of the code (`git checkout --theirs <file>` takes it wholesale).
-2. Re-apply the fork's hook: in `autoUpdater.ts`, the `const autoUpdater = isForkBuild() ? createInertUpdater() : electronAutoUpdater;` binding, the imports, and each `if (isForkBuild())` early return (`git show fork/self-managed-install:<file>` shows the fork's version); in the others, the few marked lines.
-3. `git add <file>`, then `git commit` to finish the merge, and re-run `node scripts/fork/update.mjs`. The fork's tests fail if a hook was lost.
+1. Take upstream's version of the code (`git checkout --theirs -- <file>` takes it wholesale).
+2. Re-apply the fork's hook. `git diff <previous upstream tag> fork/self-managed-install -- <file>` shows exactly what the fork added. In `autoUpdater.ts` that is the `const autoUpdater = isForkBuild() ? createInertUpdater() : electronAutoUpdater;` binding, the imports, and each `if (isForkBuild())` early return; in the other files, a few marked lines.
+3. `git add <file>`, then `git commit --no-edit` to finish the merge, and re-run `node scripts/fork/update.mjs`. It recognises the hand-finished merge and runs the fork's tests and the typecheck, which fail if a hook was lost.
 
 `git merge --abort` undoes the attempt.
 
@@ -125,6 +131,20 @@ It:
 7. Verifies the installed version, the fork marker and commit, the fork flag in `app.asar`, `app-update.yml`, and that no data file changed size or timestamp during the install.
 
 `--dry-run` runs every check and reports what a real run would stop on, without copying or installing; it is safe while Nimbalyst runs. `--backup-only` takes and verifies the backup without installing. `--interactive` shows the normal installer UI.
+
+## Pushing and publishing
+
+`node scripts/fork/push.mjs` pushes `main` and `fork/main` (`--refs "..."` for others) to `origin`. It authenticates with the token of the GitHub account that owns the fork (`gh auth token --user <owner>`) for that one command only, without switching the active `gh` account, and never falls back to it. It refuses if `origin` is the upstream repository. The repo's pre-push hook runs as usual (it typechecks), at below-normal priority.
+
+`node scripts/fork/release.mjs` publishes a GitHub Release on the fork, for downloads and a record of what was built:
+
+- **What it publishes.** Only the build of `fork/main`'s HEAD, with a clean tree. That build must have passed `smoke-test.mjs`, its installer must still have the recorded SHA-256, and HEAD must already be on `origin/fork/main`.
+- **The tag.** It tags the commit `fork-v<upstream version>-<n>`, for example `fork-v0.84.1-1`. It never uses a `v*` tag; those belong to upstream.
+- **The assets.** The installer, `SHA256SUMS.txt` and `fork-build.json`. Never `latest.yml` or blockmaps, which would make the fork's releases a live update feed for the official updater.
+- **The notes.** Generated, plus anything passed with `--notes-file`. `--dry-run` shows the tag and notes without publishing.
+- **Re-running.** If an upload fails, run it again. It reuses the tag and uploads only what is missing.
+
+A downloaded release installer cannot be installed through `install.mjs` yet, because it only trusts installers recorded by `build.mjs` on the same machine. On another machine, build there.
 
 ## Rolling back
 

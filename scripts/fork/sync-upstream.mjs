@@ -13,10 +13,13 @@
 //    merge commit. Never rebases, never merges upstream/main.
 // 4. On conflicts: lists the files, leaves the merge in progress for you to
 //    resolve (see "Resolving conflicts" in FORK.md), and exits 1.
-// 5. Otherwise installs dependencies and runs the fork's own tests.
+// 5. Otherwise installs dependencies, runs the fork's own tests and the full
+//    typecheck (--skip-tests skips both). Run again
+//    after finishing a conflicted merge by hand, it recognises HEAD as that
+//    merge and runs the same checks.
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { GENERATED_PATHS, info, git, capture, dirtyFiles, parseArgs, pnpm, runMain, step, stop, warn } from './lib/util.mjs';
+import { GENERATED_PATHS, info, git, capture, dirtyFiles, lowerPriority, parseArgs, pnpm, runMain, step, stop, warn } from './lib/util.mjs';
 
 const USAGE = 'node scripts/fork/sync-upstream.mjs [--tag vX.Y.Z] [--skip-tests]';
 const FORK_TESTS = [
@@ -36,6 +39,28 @@ async function latestStableTag() {
 }
 
 const isAncestor = (a, b) => capture('git', ['merge-base', '--is-ancestor', a, b], { allowFailure: true }).status === 0;
+
+/**
+ * Install dependencies for the merged tree, run the tests that guard the
+ * fork's hooks, and typecheck everything, at below-normal priority.
+ */
+export function verifyMergedTree({ skipTests = false } = {}) {
+  lowerPriority();
+  step('Installing dependencies');
+  pnpm(['install', '--frozen-lockfile']);
+  if (!skipTests) {
+    step("Running the fork's tests");
+    pnpm(['exec', 'vitest', '--run', ...FORK_TESTS]);
+    step('Typechecking');
+    pnpm(['typecheck']);
+  }
+}
+
+/** True when HEAD is the merge of `tag`, e.g. one finished by hand after conflicts. */
+function headMerges(tag) {
+  const second = capture('git', ['rev-parse', '-q', '--verify', 'HEAD^2'], { allowFailure: true });
+  return second.status === 0 && second.stdout === git('rev-parse', `${tag}^{commit}`);
+}
 
 export async function syncUpstream({ tag = null, skipTests = false } = {}) {
   step('Checking the checkout');
@@ -60,6 +85,13 @@ export async function syncUpstream({ tag = null, skipTests = false } = {}) {
   const current = git('describe', '--tags', '--abbrev=0', '--match', 'v*', 'HEAD');
   info(`fork/main is based on ${current}; newest stable upstream release is ${target}.`);
   if (isAncestor(target, 'HEAD')) {
+    if (headMerges(target)) {
+      // The merge was finished by hand after conflicts: the dependencies and
+      // the hook-guard tests have not run against it yet.
+      info(`HEAD is the merge of ${target}; checking it.`);
+      verifyMergedTree({ skipTests });
+      return { merged: true, tag: target };
+    }
     info(`fork/main already contains ${target}. Nothing to merge.`);
     return { merged: false, tag: target };
   }
@@ -80,17 +112,11 @@ export async function syncUpstream({ tag = null, skipTests = false } = {}) {
     const conflicts = capture('git', ['diff', '--name-only', '--diff-filter=U'], { allowFailure: true }).stdout;
     console.error(`\nThe merge of ${target} stopped with conflicts in:\n${conflicts.split(/\r?\n/).filter(Boolean).map((f) => `  ${f}`).join('\n') || `  (none listed)\n${merge.stdout}\n${merge.stderr}`}`);
     console.error('\nThe merge is left in progress. Resolve each file (see "Resolving conflicts" in FORK.md),');
-    console.error('then `git add` them and `git commit`, and run this script again. Or undo with `git merge --abort`.');
+    console.error('then `git add` them and `git commit --no-edit`, and run this script again. Or undo with `git merge --abort`.');
     stop('merge conflicts need resolving.');
   }
   info(`Merged ${target}.`);
-
-  step('Installing dependencies');
-  pnpm(['install', '--frozen-lockfile']);
-  if (!skipTests) {
-    step("Running the fork's tests");
-    pnpm(['exec', 'vitest', '--run', ...FORK_TESTS]);
-  }
+  verifyMergedTree({ skipTests });
   return { merged: true, tag: target };
 }
 
@@ -104,7 +130,7 @@ if (invokedDirectly) {
     if (args.help) { console.log(USAGE); return 0; }
     const result = await syncUpstream(args);
     console.log(result.merged
-      ? `\nfork/main now includes ${result.tag}. Next: node scripts/fork/build.mjs (or run update.mjs to build and smoke-test), then push: git push origin main fork/main`
+      ? `\nfork/main now includes ${result.tag}. Next: node scripts/fork/build.mjs (or run update.mjs to build and smoke-test), then push: node scripts/fork/push.mjs`
       : '\nUp to date.');
     return 0;
   });

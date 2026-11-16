@@ -5,8 +5,8 @@
 //
 // 1. sync-upstream: merge the newest stable upstream release into fork/main
 //    (stops on conflicts).
-// 2. build: if anything was merged, or the last build is not of the current
-//    commit, or --force-build.
+// 2. build: if the last build is not of the current commit, or --force-build.
+//    The fork's tests run before every build.
 // 3. smoke-test: boot the new build on an empty scratch profile.
 // 4. Tells you to quit Nimbalyst and run install.mjs. It never installs by
 //    itself, because installing needs Nimbalyst closed and this may be running
@@ -15,7 +15,7 @@ import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { LAST_BUILD_FILE, git, info, parseArgs, readJsonIfExists, runMain, step, stop } from './lib/util.mjs';
-import { syncUpstream } from './sync-upstream.mjs';
+import { syncUpstream, verifyMergedTree } from './sync-upstream.mjs';
 
 const USAGE = 'node scripts/fork/update.mjs [--tag vX.Y.Z] [--force-build]';
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -35,18 +35,22 @@ runMain(async () => {
   const sync = await syncUpstream({ tag: args.tag });
   const head = git('rev-parse', 'HEAD');
   const lastBuild = readJsonIfExists(LAST_BUILD_FILE);
-  const needsBuild = args.forceBuild || sync.merged || lastBuild?.commit !== head;
+  const needsBuild = args.forceBuild || lastBuild?.commit !== head;
   if (!needsBuild) {
     step('Build');
     info(`The last build (${lastBuild.installer}) is already of ${head}.`);
   } else {
+    // A merge already installed and tested; otherwise (fork-only commits since
+    // the last build) do it here, so the hook-guard tests always gate a build.
+    if (!sync.merged) verifyMergedTree();
     runScript('build.mjs', ['--skip-install']);
   }
   runScript('smoke-test.mjs');
   console.log(`
 Ready to install fork commit ${head}${sync.merged ? ` (now including upstream ${sync.tag})` : ''}.
-  1. Push the branches:   git push origin main fork/main
-  2. Quit Nimbalyst (including the tray icon).
-  3. From a normal terminal: node scripts/fork/install.mjs`);
+  1. Push the branches:   node scripts/fork/push.mjs
+  2. Optionally publish:  node scripts/fork/release.mjs
+  3. Quit Nimbalyst (including the tray icon).
+  4. From a normal terminal: node scripts/fork/install.mjs`);
   return 0;
 });

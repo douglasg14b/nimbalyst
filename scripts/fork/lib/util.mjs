@@ -12,6 +12,7 @@ export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url
 export const ELECTRON_DIR = path.join(REPO_ROOT, 'packages', 'electron');
 export const FORK_STATE_DIR = path.join(REPO_ROOT, 'nimbalyst-local', 'fork-build');
 export const LAST_BUILD_FILE = path.join(FORK_STATE_DIR, 'last-build.json');
+export const LAST_SMOKE_FILE = path.join(FORK_STATE_DIR, 'last-smoke-test.json');
 export const FORK_BUILDER_CONFIG = path.join(REPO_ROOT, 'scripts', 'fork', 'electron-builder.fork.cjs');
 
 // Files that builds and typechecks rewrite in place. They are build output,
@@ -176,3 +177,26 @@ export function parseGitHubRemote(url) {
 }
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** owner/repo of the `origin` remote. Stops if it is not GitHub or points at upstream. */
+export function originRepo() {
+  const url = git('remote', 'get-url', 'origin');
+  const parsed = parseGitHubRemote(url);
+  if (!parsed) stop(`origin (${url}) is not a GitHub repository.`);
+  if (parsed.owner.toLowerCase() === 'nimbalyst') stop(`origin points at upstream (${url}). The fork scripts only ever write to your fork.`);
+  return parsed;
+}
+
+/**
+ * Environment for one command that writes to origin, carrying the token of the
+ * GitHub account that owns the fork. The active `gh` account may be a different
+ * one, so it is never switched and never used as a fallback.
+ */
+export function forkOwnerEnv(ghUser) {
+  const r = capture('gh', ['auth', 'token', '--user', ghUser], { allowFailure: true });
+  if (r.status !== 0 || !r.stdout) stop(`gh has no login for ${ghUser}. Run: gh auth login (as ${ghUser}), then retry. The active gh account is not used instead.`);
+  return { ...process.env, GH_TOKEN: r.stdout };
+}
+
+/** git options that make a push authenticate through gh, which reads GH_TOKEN from the env. */
+export const GIT_GH_AUTH = ['-c', 'credential.helper=', '-c', 'credential.helper=!gh auth git-credential'];

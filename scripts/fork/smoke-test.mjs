@@ -10,11 +10,11 @@
 // re-registers the nimbalyst:// handler to the test exe, so it is saved first
 // and restored afterwards. Only processes of the test build's exe are closed.
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { currentPlatform } from './lib/platform.mjs';
-import { LAST_BUILD_FILE, info, parseArgs, readJsonIfExists, runMain, sleep, step, stop } from './lib/util.mjs';
+import { LAST_BUILD_FILE, LAST_SMOKE_FILE, info, parseArgs, readJsonIfExists, runMain, sleep, step, stop } from './lib/util.mjs';
 
 const USAGE = 'node scripts/fork/smoke-test.mjs [--boot-timeout <seconds>] [--idle <seconds>]';
 const SCRUB = ['ELECTRON_RUN_AS_NODE', 'PLAYWRIGHT', 'NODE_ENV', 'OFFICIAL_BUILD', 'RUN_ONE_DEV_MODE', 'ELECTRON_RENDERER_URL', 'CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT'];
@@ -114,6 +114,8 @@ runMain(async () => {
   }
   info(`Scratch profile and logs: ${path.resolve(scratchRoot)}`);
   if (failed) stop(`${failed} smoke check(s) failed.`);
+  // release.mjs publishes only a build that passed this test.
+  writeFileSync(LAST_SMOKE_FILE, `${JSON.stringify({ commit: lastBuild.commit, installerSha256: lastBuild.sha256, passedAt: new Date().toISOString() }, null, 2)}\n`);
   console.log('\nSmoke test passed.');
   return 0;
 });

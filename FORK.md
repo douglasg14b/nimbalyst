@@ -67,6 +67,14 @@ The script runs the Windows x64 steps from `.github/workflows/electron-build.yml
 
 Output goes to `%LOCALAPPDATA%\NimbalystForkBuild\release`, outside the checkout: while Nimbalyst has this repo open it locks `.asar` files under `packages\electron\release`, and electron-builder then fails with EPERM or EBUSY.
 
+Then boot the build once on an empty scratch profile (never your real data):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\fork\smoke-test.ps1
+```
+
+It can run beside a running Nimbalyst. It checks that the app reaches "App ready", that the log shows the inert updater with the expected commit and no update check, and that SQLite initialises. It saves and restores the `nimbalyst://` registration, which a packaged launch re-points at the test exe, and closes only the test build's processes.
+
 Prerequisites, not all documented upstream:
 
 - Node 24 and pnpm 12.9.1 via corepack. Corepack older than 0.36 fails to start pnpm 12 (`Cannot find module ...\pnpm\12.9.1\bin\pnpm.cjs`); run `npm i -g corepack@latest`, and if the cached `.corepack` file still lists `pnpm.cjs`, delete `%LOCALAPPDATA%\node\corepack\v1\pnpm\12.9.1` and let it download again.

@@ -76,11 +76,11 @@ try {
   $deadline = (Get-Date).AddSeconds($BootTimeoutSeconds)
   while ((Get-Date) -lt $deadline) {
     if ($proc.HasExited) { break }
-    if ((Test-Path $mainLog) -and (Select-String -Path $mainLog -Pattern 'App ready' -Quiet)) { break }
+    if ((Test-Path $mainLog) -and (Select-String -Path (Join-Path $scratch 'logs\main*.log') -Pattern 'App ready' -Quiet)) { break }
     Start-Sleep -Seconds 2
   }
   if ($proc.HasExited) { throw "the fork build exited during boot with code $($proc.ExitCode)" }
-  if (-not ((Test-Path $mainLog) -and (Select-String -Path $mainLog -Pattern 'App ready' -Quiet))) { throw "no 'App ready' in $mainLog after $BootTimeoutSeconds s" }
+  if (-not ((Test-Path $mainLog) -and (Select-String -Path (Join-Path $scratch 'logs\main*.log') -Pattern 'App ready' -Quiet))) { throw "no 'App ready' in $mainLog after $BootTimeoutSeconds s" }
   Write-Host "  App ready. Idling $IdleSeconds s (the official updater's first check would fire at 30 s)."
   Start-Sleep -Seconds $IdleSeconds
   if ($proc.HasExited) { throw "the fork build exited while idle with code $($proc.ExitCode)" }
@@ -114,7 +114,8 @@ try {
 }
 
 Write-Step 'Checking the startup log'
-$log = Get-Content (Join-Path $scratch 'logs\main.log') -Raw
+# electron-log rotates main.log to main.1.log, so read every log file.
+$log = (Get-ChildItem (Join-Path $scratch 'logs') -Filter 'main*.log' | Sort-Object Name -Descending | ForEach-Object { Get-Content $_.FullName -Raw }) -join "`n"
 $checks = [ordered]@{
   'reached App ready'                           = $log -match 'App ready'
   'inert updater bound, with the fork commit'   = $log.Contains("[fork] Fork build $($lastBuild.commit): the official updater is disabled")

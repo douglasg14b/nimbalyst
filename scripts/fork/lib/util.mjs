@@ -159,10 +159,20 @@ export function loadAsar() {
   }
 }
 
-/** package.json "version" inside a packaged app.asar. */
+/**
+ * package.json "version" inside a packaged app.asar.
+ * @electron/asar caches each archive's header by path. install.mjs reads the
+ * same path before and after the installer replaces the file, so a cached
+ * header would read the new archive at the old archive's offsets.
+ */
 export function asarAppVersion(asarPath) {
   const asar = loadAsar();
-  return JSON.parse(asar.extractFile(asarPath, 'package.json').toString('utf8')).version;
+  asar.uncache(asarPath);
+  try {
+    return JSON.parse(asar.extractFile(asarPath, 'package.json').toString('utf8')).version;
+  } finally {
+    asar.uncache(asarPath);
+  }
 }
 
 /** True when the raw app.asar bytes contain `needle` (used to prove the fork define was compiled in). */

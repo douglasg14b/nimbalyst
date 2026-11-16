@@ -27,9 +27,6 @@ import { createInertUpdater } from './forkInertUpdater';
 // Fork builds (FORK.md) never read electron-updater's lazily constructed
 // updater, so no feed, download or install-on-quit exists in them.
 const autoUpdater = isForkBuild() ? createInertUpdater() : electronAutoUpdater;
-if (isForkBuild()) {
-  log.info(`[fork] Fork build ${getForkCommit()}: the official updater is disabled (inert stub bound)`);
-}
 
 // Install the atom-feed filter before any AutoUpdaterService is constructed
 // (which is the first thing that triggers electron-updater to read the feed).
@@ -597,7 +594,13 @@ export class AutoUpdaterService {
   }
 
   public startAutoUpdateCheck(intervalMinutes = 60) {
-    if (isForkBuild()) return; // Fork builds never poll.
+    if (isForkBuild()) {
+      // Logged here, after app ready, not at module load: electron-log writes
+      // to the default userData path until the app's logger is configured, so
+      // a module-load line from a scratch-profile instance lands in the real log.
+      log.info(`[fork] Fork build ${getForkCommit()}: the official updater is disabled (inert stub bound)`);
+      return; // Fork builds never poll.
+    }
     // Initial check after 30 seconds
     setTimeout(() => {
       this.checkForUpdates();

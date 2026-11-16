@@ -67,11 +67,14 @@ Write-Step 'Checking the checkout and toolchain'
 $sha = (git rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0) { Fail 'git rev-parse failed; run from the fork checkout' }
 $branch = (git rev-parse --abbrev-ref HEAD).Trim()
-# build:win regenerates the third-party license files under resources/generated
-# from the installed tree, so a previous build leaves them modified. They are
-# build output, not source, and are left uncommitted (committing them would
-# conflict with every upstream release merge).
-$dirty = [bool](git status --porcelain --untracked-files=no -- . ':(exclude)packages/electron/resources/generated')
+# Generated files that builds rewrite in place are not source: build:win
+# regenerates the third-party license files under resources/generated, and
+# `pnpm typecheck` regenerates packages/collab-bundle/types. Leave them
+# uncommitted (committing them would conflict with every upstream release
+# merge). Line-ending-only differences do not count either.
+$dirtyFiles = @(git diff HEAD --ignore-cr-at-eol --name-only -- . ':(exclude)packages/electron/resources/generated' ':(exclude)packages/collab-bundle/types')
+$dirty = $dirtyFiles.Count -gt 0
+if ($dirty) { Write-Host "  Uncommitted changes: $($dirtyFiles -join ', ')" }
 if ($dirty -and -not $AllowDirty) {
   Fail 'the working tree has uncommitted changes. Commit them, or pass -AllowDirty for a throwaway build.'
 }

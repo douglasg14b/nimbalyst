@@ -1,4 +1,4 @@
-import { autoUpdater } from 'electron-updater';
+import { autoUpdater as electronAutoUpdater } from 'electron-updater';
 import { app, BrowserWindow, dialog } from 'electron';
 import log from 'electron-log/main';
 import * as fs from 'fs';
@@ -21,6 +21,15 @@ import {
 import { installAtomFeedFilter } from './electronUpdaterPatch';
 import { createWindowsSignatureVerifier } from './windowsSignatureVerifier';
 import type { NsisUpdater } from 'electron-updater';
+import { FORK_UPDATE_INSTRUCTIONS, getForkCommit, isForkBuild } from '../../shared/forkBuild';
+import { createInertUpdater } from './forkInertUpdater';
+
+// Fork builds (FORK.md) never read electron-updater's lazily constructed
+// updater, so no feed, download or install-on-quit exists in them.
+const autoUpdater = isForkBuild() ? createInertUpdater() : electronAutoUpdater;
+if (isForkBuild()) {
+  log.info(`[fork] Fork build ${getForkCommit()}: the official updater is disabled (inert stub bound)`);
+}
 
 // Install the atom-feed filter before any AutoUpdaterService is constructed
 // (which is the first thing that triggers electron-updater to read the feed).
@@ -89,6 +98,7 @@ export class AutoUpdaterService {
   }
 
   private configureFeedURL() {
+    if (isForkBuild()) return; // No feed in fork builds.
     const channel = getReleaseChannel();
 
     log.info(`Configuring ${channel} channel updates from GitHub`);
@@ -286,6 +296,7 @@ export class AutoUpdaterService {
    * Non-fatal: best-effort, logs and continues on failure.
    */
   private cleanupWindowsPendingDirectory(): void {
+    if (isForkBuild()) return; // The official updater's cache is not ours to clean.
     const pendingDir = this.getWindowsPendingDirectory();
     if (!pendingDir) return;
     try {
@@ -372,6 +383,10 @@ export class AutoUpdaterService {
   }
 
   private performQuitAndInstall() {
+    if (isForkBuild()) {
+      log.warn('[fork] Ignoring quit-and-install: the updater is disabled in fork builds');
+      return;
+    }
     setImmediate(async () => {
       try {
         log.info('Performing quit and install...');
@@ -582,6 +597,7 @@ export class AutoUpdaterService {
   }
 
   public startAutoUpdateCheck(intervalMinutes = 60) {
+    if (isForkBuild()) return; // Fork builds never poll.
     // Initial check after 30 seconds
     setTimeout(() => {
       this.checkForUpdates();
@@ -605,6 +621,7 @@ export class AutoUpdaterService {
   }
 
   public async checkForUpdates() {
+    if (isForkBuild()) return;
     if (this.isCheckingForUpdate) {
       log.info('Already checking for updates, skipping...');
       return;
@@ -619,6 +636,17 @@ export class AutoUpdaterService {
   }
 
   public async checkForUpdatesWithUI() {
+    if (isForkBuild()) {
+      const options = {
+        type: 'info' as const,
+        title: 'Check for Updates',
+        message: 'This is a fork build of Nimbalyst.',
+        detail: `Fork commit ${getForkCommit()}.\n\n${FORK_UPDATE_INSTRUCTIONS}`,
+      };
+      const window = this.getFrontmostWindow();
+      await (window ? dialog.showMessageBox(window, options) : dialog.showMessageBox(options));
+      return;
+    }
     if (this.isCheckingForUpdate) {
       // Already checking, don't show anything - the checking toast is already visible
       return;

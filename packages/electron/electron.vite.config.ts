@@ -91,6 +91,11 @@ const optimizeExcalidrawPlugin = () => {
 
 const isDev = process.env.NODE_ENV !== 'production';
 const isOfficialBuild = process.env.OFFICIAL_BUILD === 'true';
+// Fork builds (FORK.md): set by scripts/fork/build-win.ps1, read through src/shared/forkBuild.ts.
+const forkBuildDefines = {
+  'process.env.NIMBALYST_FORK_BUILD': JSON.stringify(process.env.NIMBALYST_FORK_BUILD === 'true' ? 'true' : 'false'),
+  'process.env.NIMBALYST_FORK_COMMIT': JSON.stringify(process.env.NIMBALYST_FORK_COMMIT ?? ''),
+};
 // IS_DEV_MODE is true only when running `npm run dev`, not for any packaged builds
 const isDevMode = isDev;
 
@@ -293,6 +298,7 @@ const config = {
   main: {
     define: {
       'process.env.OFFICIAL_BUILD': JSON.stringify(isOfficialBuild ? 'true' : 'false'),
+      ...forkBuildDefines,
       'process.env.IS_DEV_MODE': JSON.stringify(isDevMode ? 'true' : 'false'),
       // Note: RUN_ONE_DEV_MODE is intentionally NOT defined here.
       // The main process reads it from the actual runtime environment via process.env.
@@ -410,6 +416,7 @@ const config = {
     define: {
       'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV || 'development'),
       'process.env.OFFICIAL_BUILD': JSON.stringify(isOfficialBuild ? 'true' : 'false'),
+      ...forkBuildDefines,
       'process.env.IS_DEV_MODE': JSON.stringify(isDevMode ? 'true' : 'false'),
       '__CLAUDE_AGENT_SDK_VERSION__': JSON.stringify(claudeAgentSdkVersion),
     },

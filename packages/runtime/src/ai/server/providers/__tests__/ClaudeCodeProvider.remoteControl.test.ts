@@ -14,7 +14,7 @@
  *   turn, reattached when it had to be replaced, and closed on abort/destroy.
  */
 
-import { describe, expect, it, vi, beforeEach } from 'vitest';
+import { afterEach, describe, expect, it, vi, beforeEach } from 'vitest';
 
 vi.mock('electron', async () => ({
   app: { ...(await import('../../../../../../electron/test-stubs/privateUserData')).testApp, isPackaged: false },
@@ -33,6 +33,12 @@ vi.mock('../../../../electron/claudeCodeEnvironment', () => ({
 vi.mock('../claudeCode/remoteControl', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../claudeCode/remoteControl')>()),
   REMOTE_CONTROL_RESTORE_DELAY_MS: 10,
+}));
+
+// The real suggestion wait is 8s.
+vi.mock('../claudeCode/promptSuggestionWait', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../claudeCode/promptSuggestionWait')>()),
+  PROMPT_SUGGESTION_WAIT_MS: 300,
 }));
 
 const queryMock = vi.fn();
@@ -236,9 +242,15 @@ const internals = (provider: ClaudeCodeProvider) => provider as unknown as {
  * Run a first turn and turn Remote Control on while it is in flight, so the
  * bridge goes onto that turn's process. Resolves once the turn has ended.
  */
-async function firstTurnWithRemoteControl(provider: ClaudeCodeProvider, live: Live, name = 'laptop'): Promise<StreamChunk[]> {
+async function firstTurnWithRemoteControl(
+  provider: ClaudeCodeProvider,
+  live: Live,
+  name = 'laptop',
+  documentContext: object = { mode: 'agent' },
+  onChunk?: (chunk: StreamChunk) => void,
+): Promise<StreamChunk[]> {
   live.send(INIT_CHUNK);
-  const turn = runTurn(provider, 'hi');
+  const turn = runTurn(provider, 'hi', onChunk, documentContext);
   await waitFor(() => provider.isLeadBusy());
   await provider.enableRemoteControl(name);
   live.send(
@@ -427,6 +439,27 @@ describe('ClaudeCodeProvider with Remote Control on', () => {
     expect(provider.hasPendingRemoteControlTurn()).toBe(false);
   });
 
+  // A warm or restored query emits init on its own, with no prompt behind it.
+  // Treating that as a remote turn would wake the session with nothing to run.
+  it('does not start a remote turn on a lone init, and a later local turn still adopts the query', async () => {
+    const provider = await makeProvider();
+    const [live] = installQueries([liveQuery()]);
+    await firstTurnWithRemoteControl(provider, live);
+    const started: unknown[] = [];
+    provider.on('remoteControl:turnStarted', (payload) => started.push(payload));
+
+    live.send(INIT_CHUNK, { type: 'system', subtype: 'session_state_changed', state: 'running' });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(started).toEqual([]);
+    expect(provider.hasPendingRemoteControlTurn()).toBe(false);
+
+    const nextTurn = runTurn(provider, 'local');
+    await answerAfterPrompt(live, 2, answer('msg_2', 'local answer'));
+    const chunks = await nextTurn;
+    expect(queryMock).toHaveBeenCalledTimes(1);
+    expect(chunks.filter((c) => c.type === 'text').map((c) => c.content)).toEqual(['local answer']);
+  });
+
   it('replaces the parked query when the model changed, and reattaches the bridge on the new process', async () => {
     const provider = await makeProvider();
     const first = liveQuery();
@@ -506,5 +539,54 @@ describe('ClaudeCodeProvider with Remote Control on', () => {
     expect(replacement.enableRemoteControl).toHaveBeenCalledWith(true, 'laptop', { reattachSessionId: 'cse_test' });
     expect(successor.getRemoteControlStatus()).toMatchObject({ desired: true, state: 'ready' });
     await successor.disableRemoteControl();
+  });
+});
+
+/**
+ * A human turn keeps reading after `result` for the prompt suggestion frame.
+ * That wait leaves a `next()` in flight on the live query, and the phone can
+ * send a prompt during it; both must reach the park, not be lost.
+ */
+describe('ClaudeCodeProvider with Remote Control on, across the prompt suggestion wait', () => {
+  const HUMAN = { mode: 'agent', promptProvenance: { actor: 'human', origin: 'composer' } };
+
+  beforeEach(() => {
+    queryMock.mockReset();
+    ClaudeCodeProvider.setPromptSuggestionsEnabledLoader(() => true);
+  });
+  afterEach(() => {
+    ClaudeCodeProvider.setPromptSuggestionsEnabledLoader(null);
+  });
+
+  it('hands the in-flight read to the park when the wait expires, so the next chunk is not lost', async () => {
+    const provider = await makeProvider();
+    const [live] = installQueries([liveQuery()]);
+    const startedAt = Date.now();
+    const chunks = await firstTurnWithRemoteControl(provider, live, 'laptop', HUMAN);
+    // The turn waited out the suggestion window before parking.
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(250);
+    expect(chunks.map((chunk) => chunk.type)).toEqual(['text', 'complete']);
+
+    live.send({ type: 'system', subtype: 'bridge_state', state: 'connected' });
+    await waitFor(() => provider.getRemoteControlStatus().state === 'connected');
+  });
+
+  it('starts a remote turn when the phone sends a prompt during the wait, without persisting it in the finished turn', async () => {
+    const provider = await makeProvider();
+    const [live] = installQueries([liveQuery()]);
+    const started: Array<{ text: string }> = [];
+    provider.on('remoteControl:turnStarted', (payload) => started.push(payload));
+    const phone = { type: 'user', message: { role: 'user', content: 'from phone mid-wait' }, parent_tool_use_id: null };
+
+    const chunks = await firstTurnWithRemoteControl(provider, live, 'laptop', HUMAN, (chunk) => {
+      if (chunk.type === 'complete') live.send(phone);
+    });
+
+    expect(chunks.map((chunk) => chunk.type)).toEqual(['text', 'complete']);
+    await waitFor(() => started.length === 1);
+    expect(started[0].text).toBe('from phone mid-wait');
+    expect(provider.hasPendingRemoteControlTurn()).toBe(true);
+    const persisted = internals(provider).logAgentMessageNonBlocking.mock.calls.map((call) => String(call[3]));
+    expect(persisted.some((content) => content.includes('from phone mid-wait'))).toBe(false);
   });
 });

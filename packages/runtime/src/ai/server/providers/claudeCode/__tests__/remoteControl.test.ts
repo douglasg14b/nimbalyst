@@ -72,11 +72,14 @@ describe('classifyParkedChunk', () => {
   it('starts a turn only on positive evidence', () => {
     expect(classifyParkedChunk({ type: 'user', message: { content: [{ type: 'text', text: 'from phone' }] } }))
       .toEqual({ kind: 'turn-start', text: 'from phone' });
-    expect(classifyParkedChunk({ type: 'system', subtype: 'init' })).toEqual({ kind: 'turn-start', text: null });
-    expect(classifyParkedChunk({ type: 'system', subtype: 'session_state_changed', state: 'running' }))
-      .toEqual({ kind: 'turn-start', text: null });
     expect(classifyParkedChunk({ type: 'assistant', message: { content: [] } })).toEqual({ kind: 'turn-start', text: null });
     expect(classifyParkedChunk({ type: 'stream_event', event: {} })).toEqual({ kind: 'turn-start', text: null });
+  });
+
+  it('holds init and a running state as preamble: a warm query emits init with no prompt behind it', () => {
+    expect(classifyParkedChunk({ type: 'system', subtype: 'init' })).toEqual({ kind: 'preamble' });
+    expect(classifyParkedChunk({ type: 'system', subtype: 'session_state_changed', state: 'running' }))
+      .toEqual({ kind: 'preamble' });
   });
 
   it('drops the frames that trail a finished turn', () => {

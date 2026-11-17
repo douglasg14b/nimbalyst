@@ -105,9 +105,8 @@ export const REMOTE_CONTROL_PLACEHOLDER_PROMPT = 'Prompt from Remote Control';
 /** Delay before an idle session whose bridge died with its turn gets a fresh one. */
 export const REMOTE_CONTROL_RESTORE_DELAY_MS = 1_500;
 
-/** How long the idle pump keeps reading after a remote turn starts, looking for the prompt text. */
-export const REMOTE_PROMPT_TEXT_WAIT_MS = 2_000;
-export const REMOTE_PROMPT_TEXT_MAX_CHUNKS = 8;
+/** Preamble chunks (init, state "running") the idle pump keeps for a turn that may follow. */
+export const REMOTE_PREAMBLE_MAX_CHUNKS = 8;
 
 /** Map a `system/bridge_state` value onto the states the UI shows. Unknown values never read as "up". */
 export function mapBridgeState(raw: string): RemoteControlState {
@@ -216,17 +215,20 @@ export type ParkedChunkClass =
   | { kind: 'bridge'; state: string }
   | { kind: 'bridge-off' }
   | { kind: 'noise' }
+  | { kind: 'preamble' }
   | { kind: 'turn-start'; text: string | null }
   | { kind: 'unknown' };
 
 /**
  * Classify a chunk read from a parked query, where no turn is running.
  *
- * Only positive evidence starts a turn: a user prompt, an assistant or stream
- * event, `system/init`, or `session_state_changed: running`. An unrecognised
- * shape is reported as `unknown` so the caller can log it and keep waiting; a
- * false "turn started" would run an empty turn that hangs until the stall
- * watchdog fires.
+ * Only content starts a turn: a user prompt, an assistant message or a stream
+ * event. `system/init` and `session_state_changed: running` are `preamble`:
+ * they usually precede a turn, but a CLI may also send them on its own (for
+ * example on a warm query that has no prompt yet), and treating them as a turn
+ * would run an empty turn that hangs until the stall watchdog fires. The caller
+ * keeps the preamble and replays it if a turn follows. An unrecognised shape is
+ * `unknown`, logged and skipped.
  *
  * UNVERIFIED: nobody has yet observed the exact chunks a prompt sent from the
  * phone produces while the query is parked (see nimbalyst-local/rc-probe).
@@ -239,9 +241,9 @@ export function classifyParkedChunk(chunk: unknown): ParkedChunkClass {
   if (isRemoteSideDisable(c)) return { kind: 'bridge-off' };
   if (NOISE_TYPES.has(c.type)) return { kind: 'noise' };
   if (c.type === 'system') {
-    if (c.subtype === 'init') return { kind: 'turn-start', text: null };
+    if (c.subtype === 'init') return { kind: 'preamble' };
     if (c.subtype === 'session_state_changed') {
-      return c.state === 'running' ? { kind: 'turn-start', text: null } : { kind: 'noise' };
+      return c.state === 'running' ? { kind: 'preamble' } : { kind: 'noise' };
     }
     if (typeof c.subtype === 'string' && NOISE_SYSTEM_SUBTYPES.has(c.subtype)) return { kind: 'noise' };
     return { kind: 'unknown' };

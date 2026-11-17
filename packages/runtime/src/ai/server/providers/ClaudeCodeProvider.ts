@@ -119,8 +119,7 @@ import {
   REMOTE_CONTROL_PLACEHOLDER_PROMPT,
   REMOTE_CONTROL_PROMPT_ORIGIN,
   REMOTE_CONTROL_RESTORE_DELAY_MS,
-  REMOTE_PROMPT_TEXT_MAX_CHUNKS,
-  REMOTE_PROMPT_TEXT_WAIT_MS,
+  REMOTE_PREAMBLE_MAX_CHUNKS,
   asRemoteControlQuery,
   bridgeStateOf,
   chunkShapeKey,
@@ -207,8 +206,10 @@ import { exitPlanModeDenialReason, type ExitPlanModeResponse } from '../../exitP
 /** A live query kept open between turns while Remote Control is on (GH #1480). */
 interface ParkedRemoteControlQuery {
   adopted: AdoptedQuery<Query, AgentToolHooks | null>;
-  /** Chunks the idle pump read after a remote turn started; replayed to the adopting turn. */
+  /** Chunks the idle pump read for a remote turn that started; replayed to the adopting turn. */
   buffered: unknown[];
+  /** Init / "running" chunks seen while idle; become part of `buffered` only if a turn follows. */
+  preamble: unknown[];
   spawnKey: string;
   modelVariant: string | null;
   sessionId: string | undefined;
@@ -808,7 +809,9 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
 
     // A follow-up while a background task keeps the previous turn draining
     // adopts that live query; aborting it would kill the task with the process.
-    const drainAdopted = this.canAcceptFollowUpDuringDrain() && this.liveQueryModelVariant === this.resolveModelVariant()
+    // A remote-turn wake never does: its prompt lives on a parked query, and
+    // taking the draining one would leave it with nothing to run.
+    const drainAdopted = !remoteTurnRequested && this.canAcceptFollowUpDuringDrain() && this.liveQueryModelVariant === this.resolveModelVariant()
       ? await this.takeOverDrainingQuery()
       : null;
     // With Remote Control on, the previous turn may have parked its live query
@@ -2863,6 +2866,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
         toolHooksService: this.toolHooksService,
       },
       buffered: [],
+      preamble: [],
       spawnKey: args.turnSpawnKey,
       modelVariant: this.liveQueryModelVariant,
       sessionId: args.sessionId,
@@ -2906,46 +2910,37 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
 
   /**
    * Read the next chunk of a parked query. Only a chunk clears `pendingNext`:
-   * on stop or timeout the in-flight `next()` stays there for whoever reads
-   * next, and on end the settled promise stays so an adopter sees the end too.
+   * on stop the in-flight `next()` stays there for the adopting turn, and on
+   * end the settled promise stays so an adopter sees the end too.
    */
   private async readParkedChunk(
     parked: ParkedRemoteControlQuery,
     stopped: Promise<void>,
-    timeoutMs?: number,
-  ): Promise<{ kind: 'stop' } | { kind: 'timeout' } | { kind: 'end'; error?: unknown } | { kind: 'chunk'; value: unknown }> {
+  ): Promise<{ kind: 'stop' } | { kind: 'end'; error?: unknown } | { kind: 'chunk'; value: unknown }> {
     const next = (parked.adopted.pendingNext ?? parked.adopted.iterator.next()) as Promise<IteratorResult<unknown>>;
     parked.adopted.pendingNext = next;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    type Read = { kind: 'stop' } | { kind: 'timeout' } | { kind: 'end'; error?: unknown } | { kind: 'chunk'; value: unknown };
-    const racers: Promise<Read>[] = [
+    type Read = { kind: 'stop' } | { kind: 'end'; error?: unknown } | { kind: 'chunk'; value: unknown };
+    const read = await Promise.race<Read>([
       next.then(
         (result): Read => (result.done ? { kind: 'end' } : { kind: 'chunk', value: result.value }),
         (error): Read => ({ kind: 'end', error }),
       ),
       stopped.then((): Read => ({ kind: 'stop' })),
-    ];
-    if (timeoutMs !== undefined) {
-      racers.push(new Promise<Read>((resolve) => { timer = setTimeout(() => resolve({ kind: 'timeout' }), timeoutMs); }));
-    }
-    try {
-      const read = await Promise.race(racers);
-      if (read.kind === 'chunk') parked.adopted.pendingNext = null;
-      return read;
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
+    ]);
+    if (read.kind === 'chunk') parked.adopted.pendingNext = null;
+    return read;
   }
 
   /**
    * The idle pump. Bridge chunks update the state; noise is dropped; the CLI
-   * exiting means the bridge is down; the first turn-starting chunk is a
-   * prompt sent from the phone, which stops the pump and wakes the session.
+   * exiting means the bridge is down; the first chunk with turn content (a
+   * user prompt, assistant message or stream event) is a prompt sent from the
+   * phone, which stops the pump and wakes the session.
    */
   private async runParkedPump(parked: ParkedRemoteControlQuery, stopped: Promise<void>): Promise<void> {
     while (this.parkedQuery === parked) {
       const read = await this.readParkedChunk(parked, stopped);
-      if (read.kind === 'stop' || read.kind === 'timeout' || this.parkedQuery !== parked) return;
+      if (read.kind === 'stop' || this.parkedQuery !== parked) return;
       if (read.kind === 'end') {
         console.log(`[CLAUDE-CODE] REMOTE_CONTROL: the parked query ended while idle${read.error ? ' with an error' : ''}`);
         this.parkedQuery = null;
@@ -2969,18 +2964,19 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
         case 'unknown':
           this.logRemoteControlShapeOnce('unrecognised chunk while parked', chunk);
           continue;
+        case 'preamble':
+          // Kept for the turn it may introduce; dropped if a local turn adopts first.
+          this.logRemoteControlShapeOnce('preamble chunk while parked', chunk);
+          parked.preamble.push(chunk);
+          if (parked.preamble.length > REMOTE_PREAMBLE_MAX_CHUNKS) parked.preamble.shift();
+          continue;
         case 'turn-start': {
-          parked.buffered.push(chunk);
-          let text = classified.text;
-          if (text === null) {
-            const collected = await this.collectRemotePromptText(parked, stopped);
-            if (collected === 'stopped' || this.parkedQuery !== parked) return;
-            text = collected;
-          }
+          parked.buffered.push(...parked.preamble, chunk);
+          parked.preamble = [];
           // UNVERIFIED: the shape of a remote prompt on this stream has not been
           // observed yet. This line is how the first real one gets recorded.
-          console.log(`[CLAUDE-CODE] REMOTE_CONTROL: remote turn started (first chunk ${describeChunkShape(chunk)}; prompt text ${text ? 'found' : 'not found, using a placeholder'})`);
-          parked.remoteTurn = { text: text ?? REMOTE_CONTROL_PLACEHOLDER_PROMPT };
+          console.log(`[CLAUDE-CODE] REMOTE_CONTROL: remote turn started (first chunk ${describeChunkShape(chunk)}; prompt text ${classified.text ? 'found' : 'not found, using a placeholder'})`);
+          parked.remoteTurn = { text: classified.text ?? REMOTE_CONTROL_PLACEHOLDER_PROMPT };
           this.emit('remoteControl:turnStarted', {
             sessionId: parked.sessionId ?? this.rcSessionId,
             text: parked.remoteTurn.text,
@@ -2989,29 +2985,6 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
         }
       }
     }
-  }
-
-  /** After a turn-start without text, read a little further for the user chunk carrying the prompt. */
-  private async collectRemotePromptText(
-    parked: ParkedRemoteControlQuery,
-    stopped: Promise<void>,
-  ): Promise<string | null | 'stopped'> {
-    const deadline = Date.now() + REMOTE_PROMPT_TEXT_WAIT_MS;
-    for (let index = 0; index < REMOTE_PROMPT_TEXT_MAX_CHUNKS; index++) {
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) return null;
-      const read = await this.readParkedChunk(parked, stopped, remaining);
-      if (read.kind === 'stop') return 'stopped';
-      if (read.kind !== 'chunk') return null;
-      const bridgeState = bridgeStateOf(read.value);
-      if (bridgeState !== null) {
-        this.applyBridgeState(bridgeState, parked.adopted.query);
-        continue;
-      }
-      parked.buffered.push(read.value);
-      if (isUserPromptChunk(read.value)) return extractUserPromptText(read.value);
-    }
-    return null;
   }
 
   private discardParkedQuery(reason: string): void {
@@ -3132,6 +3105,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
         toolHooksService,
       },
       buffered: [],
+      preamble: [],
       spawnKey: context.spawnKey,
       modelVariant: this.resolveModelVariant(),
       sessionId: context.sessionId,

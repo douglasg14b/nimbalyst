@@ -131,11 +131,13 @@ export async function runStrandedRemoteControlTurn(
   deps: StrandedRemoteTurnDeps,
 ): Promise<void> {
   if (promptOrigin === REMOTE_CONTROL_PROMPT_ORIGIN) return;
-  if (deps.isSessionActive(sessionId)) return;
-  const text = deps.pendingRemoteTurnText(sessionId);
-  if (text === null) return;
-  deps.logInfo(`[AIService] Running a pending Remote Control prompt for ${sessionId} before the local prompt`);
+  // Every send passes through here, for every provider: fail open, so nothing
+  // in this check can stop a prompt from being sent.
   try {
+    if (deps.isSessionActive(sessionId)) return;
+    const text = deps.pendingRemoteTurnText(sessionId);
+    if (text === null) return;
+    deps.logInfo(`[AIService] Running a pending Remote Control prompt for ${sessionId} before the local prompt`);
     await deps.runRemoteTurn(text);
   } catch (error) {
     // The local prompt still runs; the provider then reports the mixed turn.

@@ -108,6 +108,17 @@ describe('runStrandedRemoteControlTurn', () => {
     }
   });
 
+  it('fails open when the checks themselves throw, so no send is ever blocked', async () => {
+    for (const overrides of [
+      { isSessionActive: () => { throw new Error('state'); } },
+      { pendingRemoteTurnText: () => { throw new Error('lookup'); } },
+    ]) {
+      const { deps } = strandedDeps(overrides);
+      await expect(runStrandedRemoteControlTurn('s1', undefined, deps)).resolves.toBeUndefined();
+      expect(deps.runRemoteTurn).not.toHaveBeenCalled();
+    }
+  });
+
   it('still lets the local prompt run when the remote turn fails', async () => {
     const logError = vi.fn();
     const { deps } = strandedDeps({ runRemoteTurn: vi.fn(async () => { throw new Error('boom'); }), logError });

@@ -395,7 +395,9 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
   private parkedQuery: ParkedRemoteControlQuery | null = null;
   // A warm query being spawned to carry the bridge while idle.
   private rcWarmSpawn: Promise<void> | null = null;
-  private rcWarmSpawnCancelled = false;
+  // Bumped by every cancel; a spawn whose token is stale knows it was cancelled,
+  // so a new spawn can start while a cancelled one is still settling.
+  private rcWarmSpawnToken = 0;
   // The warm query's process while it starts up, before it is parked; held so
   // cancelling the spawn (destroy, quit, disable, a turn starting) closes it.
   private rcWarmQueryStarting: Query | null = null;
@@ -841,6 +843,10 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     // This turn runs a prompt the user sent from their phone or browser: the
     // CLI already has it, so nothing is pushed and the CLI's echo of it is dropped.
     const adoptedForRemoteTurn = parkedAdoption?.remoteTurn === true;
+    // A phone turn runs on a process spawned for an earlier turn, and its wake
+    // context carries none of that turn's spawn inputs (worktree, voice). It
+    // re-parks the process under the key it was spawned with.
+    const parkSpawnKey = adoptedForRemoteTurn ? parkedAdoption!.spawnKey : turnSpawnKey;
     if (remoteTurnRequested && !adoptedForRemoteTurn) {
       // The remote prompt was already consumed by another turn, or the bridge
       // process died before this wake ran. Running it again would send it twice.
@@ -969,12 +975,15 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
           options
         });
       if (!adopted) this.liveQueryModelVariant = this.resolveModelVariant();
-      if (sessionId && workspacePath) {
+      if (sessionId && workspacePath && !adoptedForRemoteTurn) {
         // What a Remote Control warm query is rebuilt from while the session is
-        // idle. Without this turn's prompt and attachments, and with only the
-        // one documentContext field a resumed spawn reads, so the open file's
-        // content is not kept alive. The system prompt and env maps are the
-        // provider's per-session values, shared by reference, not copies.
+        // idle (not from a phone turn, whose bare wake context lacks the spawn
+        // inputs). Without this turn's prompt and attachments, and with only
+        // the one documentContext field a resumed spawn reads, so the open
+        // file's content is not kept alive. What remains is what a spawn needs:
+        // this turn's system prompt string and settings/shell env maps. They
+        // are rebuilt each turn, so one turn's worth stays referenced until the
+        // next turn replaces it, also with Remote Control off.
         this.lastSpawnContext = {
           sdkOptionsParams: {
             ...sdkOptionsParams,
@@ -1954,7 +1963,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
           turnIterator,
           turnPendingNext,
           turnRemotePreamble,
-          turnSpawnKey,
+          turnSpawnKey: parkSpawnKey,
           sessionId,
           completeEmitted: state.completeEmitted,
           errored: turnErrored,
@@ -2837,7 +2846,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     spawnKey: string,
     wantRemoteTurn: boolean,
     sessionId: string | undefined,
-  ): Promise<{ adopted: AdoptedQuery<Query, AgentToolHooks | null>; remoteTurn: boolean; remoteText: string | null } | null> {
+  ): Promise<{ adopted: AdoptedQuery<Query, AgentToolHooks | null>; remoteTurn: boolean; remoteText: string | null; spawnKey: string } | null> {
     if (this.rcWarmSpawn && !this.parkedQuery) {
       // A warm query is still starting. Never wait for it: that can take up
       // to the 30s init timeout, and a turn waiting here has no abort
@@ -2881,6 +2890,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       },
       remoteTurn: !!parked.remoteTurn && wantRemoteTurn,
       remoteText,
+      spawnKey: parked.spawnKey,
     };
   }
 
@@ -3111,7 +3121,10 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
 
   private cancelRemoteControlWarmSpawn(): void {
     if (!this.rcWarmSpawn) return;
-    this.rcWarmSpawnCancelled = true;
+    this.rcWarmSpawnToken++;
+    // Forget it now: it settles on its own, and nothing should wait on it or be
+    // blocked by it (a re-enable, or the restore an abort schedules).
+    this.rcWarmSpawn = null;
     // Still starting: nobody else holds this process, so close it now rather
     // than when its init settles (up to the 30s timeout).
     const starting = this.rcWarmQueryStarting;
@@ -3140,16 +3153,15 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     if (!this.sessions.getSessionId(context.sessionId)) {
       return Promise.reject(new Error('Remote Control needs the Claude conversation to exist first. Send a message, then turn it on.'));
     }
-    this.rcWarmSpawnCancelled = false;
-    const spawn = this.runRemoteControlWarmSpawn(context);
+    const spawn = this.runRemoteControlWarmSpawn(context, this.rcWarmSpawnToken);
     this.rcWarmSpawn = spawn;
     const clear = () => { if (this.rcWarmSpawn === spawn) this.rcWarmSpawn = null; };
     spawn.then(clear, clear);
     return spawn;
   }
 
-  private async runRemoteControlWarmSpawn(context: LastSpawnContext): Promise<void> {
-    const cancelled = () => this.rcWarmSpawnCancelled || !this.rcDesired || this.rcDestroyed;
+  private async runRemoteControlWarmSpawn(context: LastSpawnContext, token: number): Promise<void> {
+    const cancelled = () => token !== this.rcWarmSpawnToken || !this.rcDesired || this.rcDestroyed;
     this.setRemoteControlState('connecting', null);
     const abortController = new AbortController();
     const toolHooksService = this.createToolHooksService(context.workspacePath, context.sessionId, context.permissionsPath, false);

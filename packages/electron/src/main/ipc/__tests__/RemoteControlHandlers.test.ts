@@ -185,16 +185,6 @@ describe('createRemoteControlSnapshotPusher', () => {
     return { push, sent, logWarn, fallback: vi.fn() };
   }
 
-  // Every claude-code turn pushes the current snapshot; with Remote Control
-  // off it is the same snapshot every time and must not re-render anything.
-  it('drops a per-turn push the renderer already has', async () => {
-    const { push, sent, fallback } = pusherWith();
-    await push(offSnapshot, { onlyIfChanged: true, fallback });
-    await push(offSnapshot, { onlyIfChanged: true, fallback });
-    await push(offSnapshot, { onlyIfChanged: true, fallback });
-    expect(sent).toHaveLength(1);
-  });
-
   it('never lets a snapshot that resolved late overwrite a newer one', async () => {
     let releaseFirst!: (path: string) => void;
     let calls = 0;

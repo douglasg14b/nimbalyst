@@ -322,16 +322,19 @@ const pushRemoteControlSnapshot = createRemoteControlSnapshotPusher({
  * session's workspace, falling back to the sender of the turn that installed
  * the listener. Idle-time transitions arrive long after that turn ended.
  */
-function sendRemoteControlSnapshot(
-  event: Electron.IpcMainInvokeEvent,
-  snapshot: RemoteControlSnapshot,
-  onlyIfChanged = false,
-): void {
+function sendRemoteControlSnapshot(event: Electron.IpcMainInvokeEvent, snapshot: RemoteControlSnapshot): void {
   void pushRemoteControlSnapshot(snapshot, {
-    onlyIfChanged,
     fallback: (payload) => { safeSend(event, 'ai:remote-control:changed', payload); },
   });
 }
+
+/**
+ * Providers that already pushed their first snapshot. Keyed by instance, not
+ * content: a replacement provider (model change, refresh) must push again even
+ * when its snapshot equals the last one, because a chip that remounted in
+ * between pulled `active: false` and is hiding.
+ */
+const remoteControlInitialPushDone = new WeakSet<object>();
 
 export class MessageStreamingHandler {
   private readonly svc: AIServiceInternal;
@@ -477,13 +480,24 @@ export class MessageStreamingHandler {
     await runStrandedRemoteControlTurn(sessionId, (documentContext as any)?.promptOrigin, {
       isSessionActive: (id) => getSessionStateManager().isSessionActive(id),
       pendingRemoteTurnText: (id) => pendingRemoteControlTurnText(id, 'claude-code'),
-      runRemoteTurn: (text) => this.handle(
-        event,
-        text,
-        { promptOrigin: REMOTE_CONTROL_PROMPT_ORIGIN } as DocumentContext,
-        sessionId,
-        wakeWorkspacePath,
-      ),
+      runRemoteTurn: async (text) => {
+        // Held as a queue chain while it runs, so its completion does not
+        // dispatch a queued prompt alongside the local prompt waiting here;
+        // the local turn's own completion drives the queue as usual.
+        const holdsQueue = !this.svc.sessionsProcessingQueue.has(sessionId);
+        if (holdsQueue) this.svc.sessionsProcessingQueue.add(sessionId);
+        try {
+          return await this.handle(
+            event,
+            text,
+            { promptOrigin: REMOTE_CONTROL_PROMPT_ORIGIN } as DocumentContext,
+            sessionId,
+            wakeWorkspacePath,
+          );
+        } finally {
+          if (holdsQueue) this.svc.sessionsProcessingQueue.delete(sessionId);
+        }
+      },
       logInfo: (logMessage) => logger.main.info(logMessage),
       logError: (logMessage, error) => logger.main.error(`${logMessage}:`, error),
     });
@@ -976,9 +990,12 @@ export class MessageStreamingHandler {
       this.installListener(provider, 'remoteControl:turnStarted', onRemoteControlTurnStarted);
 
       // The chip's mount-time pull can run before this provider existed;
-      // now that it does, push the snapshot that pull could not see. Only when
-      // it differs from the last push: every turn runs this.
-      sendRemoteControlSnapshot(event, getRemoteControlSnapshot(session.id, session.provider), true);
+      // now that it does, push the snapshot that pull could not see. Once per
+      // provider instance, not per turn: later changes arrive as events.
+      if (!remoteControlInitialPushDone.has(provider)) {
+        remoteControlInitialPushDone.add(provider);
+        sendRemoteControlSnapshot(event, getRemoteControlSnapshot(session.id, session.provider));
+      }
     }
 
     // Forward any provider-side title updates to all renderers so the session

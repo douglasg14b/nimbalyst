@@ -430,6 +430,20 @@ describe('ClaudeCodeProvider with Remote Control on', () => {
     await provider.disableRemoteControl();
   });
 
+  // Stop with no turn following used to leave the cancelled warm spawn
+  // blocking the restore, so the chip sat at "connecting" with nothing running.
+  it('restores the bridge on a fresh warm query after Stop cancels one that was starting', async () => {
+    const { provider, warm, lives, releaseInit } = await enableAtIdleWithSlowWarmQuery();
+    lives[2] = liveQuery();
+
+    provider.abort();
+    expect(warm.close).toHaveBeenCalled();
+
+    await waitFor(() => queryMock.mock.calls.length === 3 && provider.getRemoteControlStatus().state === 'ready');
+    releaseInit();
+    await provider.disableRemoteControl();
+  });
+
   // The warm query exists only as a starting process until its init settles
   // (up to 30s). Destroy (and quit, and disable) must close it right away.
   it('closes a warm query that is still starting when the provider is destroyed', async () => {
@@ -507,6 +521,33 @@ describe('ClaudeCodeProvider with Remote Control on', () => {
     expect((await localTurn).filter((c) => c.type === 'text').map((c) => c.content)).toEqual(['local answer']);
     await new Promise((resolve) => setTimeout(resolve, 30));
     expect(started).toHaveLength(1);
+  });
+
+  // The wake sends the phone turn with a bare context (no worktree path, no
+  // voice flag). That turn runs on the parked process, so it must re-park it
+  // under the key the process was spawned with, not one built from that context.
+  it('keeps the process spawn key across a phone turn, so the next local turn still adopts it', async () => {
+    const provider = await makeProvider();
+    const [live] = installQueries([liveQuery()]);
+    const WORKTREE = { mode: 'agent', worktreePath: '/repo/.worktrees/feature' };
+    await firstTurnWithRemoteControl(provider, live, 'laptop', WORKTREE);
+    const started: unknown[] = [];
+    provider.on('remoteControl:turnStarted', (payload) => started.push(payload));
+
+    live.send({ type: 'user', message: { role: 'user', content: 'from phone' }, parent_tool_use_id: null });
+    await waitFor(() => started.length === 1);
+    const remoteTurn = runTurn(provider, 'from phone', undefined, { mode: 'agent', promptOrigin: 'remote_control' });
+    live.send(
+      { type: 'assistant', session_id: 'sdk-session-1', message: { id: 'msg_r', content: [{ type: 'text', text: 'phone answer' }] } },
+      { type: 'result', subtype: 'success', is_error: false, num_turns: 1 },
+    );
+    await remoteTurn;
+
+    const localTurn = runTurn(provider, 'local', undefined, WORKTREE);
+    await answerAfterPrompt(live, 2, answer('msg_l', 'local answer'));
+    await localTurn;
+    expect(queryMock).toHaveBeenCalledTimes(1);
+    expect(live.close).not.toHaveBeenCalled();
   });
 
   it('falls back to a placeholder prompt when the remote turn carries no readable text', async () => {

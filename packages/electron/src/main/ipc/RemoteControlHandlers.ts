@@ -128,20 +128,17 @@ export interface RemoteControlSnapshotPushDeps {
 }
 
 /**
- * Pushes snapshots to the renderer. Three guarantees: a snapshot resolved late
+ * Pushes snapshots to the renderer. Two guarantees: a snapshot resolved late
  * never overwrites a newer one for the same session (the workspace lookup is
- * async, so two pushes can settle out of order); `onlyIfChanged` pushes (the
- * one every turn makes) are dropped when the renderer already has that exact
- * snapshot, so a session with Remote Control off re-renders nothing per turn;
- * and a send to a disposed frame is logged, never an unhandled rejection.
+ * async, so two pushes can settle out of order), and a send to a disposed
+ * frame is logged, never an unhandled rejection.
  */
 export function createRemoteControlSnapshotPusher(deps: RemoteControlSnapshotPushDeps) {
   let sequence = 0;
   const latest = new Map<string, number>();
-  const lastSent = new Map<string, string>();
   return (
     snapshot: RemoteControlSnapshot,
-    options: { onlyIfChanged?: boolean; fallback: (payload: unknown) => void },
+    options: { fallback: (payload: unknown) => void },
   ): Promise<void> => {
     const sessionId = snapshot.sessionId;
     const mine = ++sequence;
@@ -149,9 +146,6 @@ export function createRemoteControlSnapshotPusher(deps: RemoteControlSnapshotPus
     return (async () => {
       const workspacePath = await deps.resolveWorkspacePath(sessionId);
       if (latest.get(sessionId) !== mine) return;
-      const key = JSON.stringify(snapshot);
-      if (options.onlyIfChanged && lastSent.get(sessionId) === key) return;
-      lastSent.set(sessionId, key);
       const payload = workspacePath ? { ...snapshot, workspacePath } : snapshot;
       if (!workspacePath || !deps.sendToWorkspace(workspacePath, payload)) options.fallback(payload);
     })().catch((error) => {

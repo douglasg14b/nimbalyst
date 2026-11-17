@@ -61,10 +61,10 @@ Run `node scripts/fork/sync-upstream.mjs`, adding `--tag vX.Y.Z` if one was give
 
 List the conflicted files: `git diff --name-only --diff-filter=U`. Then sort them.
 
-**Files you may resolve:** only those in FORK.md's "What differs from upstream" table. Those are the fork's known hooks.
+**Files you may resolve:** only those in the tables in FORK.md's "What differs from upstream" section. Those are the fork's known changes.
 
 For each of these files:
-1. See exactly what the fork added: `git diff <previous upstream tag> fork/self-managed-install -- <file>`. The previous tag is the base that `sync-upstream.mjs` printed ("fork/main is based on ..."). Topic branches use the same pattern.
+1. See exactly what the fork added: `git diff <previous upstream tag> <branch> -- <file>`, where `<branch>` is the branch the table names for that file (`fork/self-managed-install` for the first table). The previous tag is the base that `sync-upstream.mjs` printed ("fork/main is based on ..."). A file can be in more than one branch; re-apply each branch's change.
 2. Take upstream's version: `git checkout --theirs -- <file>`.
 3. Re-apply the fork's lines to it with the Edit tool. Keep upstream's code everywhere else. Keep each hook's behaviour: with the fork flag set, nothing may reach the official updater.
 4. Check that no conflict markers remain, then `git add <file>`.

@@ -26,6 +26,13 @@ const FORK_TESTS = [
   'packages/electron/src/main/services/__tests__/autoUpdater.forkBuild.test.ts',
   'packages/electron/src/main/services/__tests__/forkUpdateStatus.test.ts',
   'packages/electron/src/main/services/__tests__/autoUpdater.channelPolicy.test.ts',
+  // fork/worktree-auto-commit
+  'packages/electron/src/main/mcp/__tests__/gitCommitProposalTarget.test.ts',
+  // fork/remote-control
+  'packages/runtime/src/ai/server/providers/__tests__/ClaudeCodeProvider.remoteControl.test.ts',
+  'packages/runtime/src/ai/server/providers/claudeCode/__tests__/remoteControl.test.ts',
+  'packages/electron/src/main/ipc/__tests__/RemoteControlHandlers.test.ts',
+  'packages/electron/src/main/services/ai/__tests__/remoteControlWake.test.ts',
 ];
 
 async function latestStableTag() {

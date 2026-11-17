@@ -57,6 +57,15 @@ import {
   buildMcpSessionStatusSnapshot,
   type McpSessionStatusInput,
 } from '@nimbalyst/runtime/types/MCPServerConfig';
+import type { RemoteControlStatus } from '@nimbalyst/runtime/ai/server/providers/claudeCode/remoteControl';
+import {
+  REMOTE_CONTROL_PROVIDERS,
+  getRemoteControlSnapshot,
+  hasPendingRemoteControlTurn,
+  snapshotFromStatus,
+  type RemoteControlSnapshot,
+} from '../../ipc/RemoteControlHandlers';
+import { createRemoteControlWakeListener } from './remoteControlWake';
 import { toolRegistry } from './tools';
 import type { DriveReason } from './QueueDriveService';
 import { resolveExtensionAgentRef } from './providerResolution';
@@ -292,6 +301,22 @@ async function getWorkspacePathForSession(sessionId: string): Promise<string | n
     // Ignore — caller will skip the broadcast.
   }
   return null;
+}
+
+/**
+ * Push a Remote Control snapshot (GH #1480) to the window that owns the
+ * session's workspace, falling back to the sender of the turn that installed
+ * the listener. Idle-time transitions arrive long after that turn ended.
+ */
+function sendRemoteControlSnapshot(event: Electron.IpcMainInvokeEvent, snapshot: RemoteControlSnapshot): void {
+  void getWorkspacePathForSession(snapshot.sessionId).then((workspacePath) => {
+    const targetWindow = workspacePath ? findWindowByWorkspace(workspacePath) : null;
+    if (targetWindow && !targetWindow.isDestroyed()) {
+      targetWindow.webContents.send('ai:remote-control:changed', { ...snapshot, workspacePath });
+    } else {
+      safeSend(event, 'ai:remote-control:changed', snapshot);
+    }
+  });
 }
 
 export class MessageStreamingHandler {
@@ -875,6 +900,52 @@ export class MessageStreamingHandler {
       });
     };
     this.installListener(provider, 'mcpServerStatus:changed', onMcpServerStatusChanged);
+
+    // Remote Control transitions (GH #1480). Like the MCP listener this must
+    // survive turn boundaries: the bridge lives on a parked query between
+    // turns and can drop, reconnect or be restored while the session is idle.
+    // Idle pushes go to the window that owns the session's workspace, since
+    // this turn's sender may be gone by then.
+    if (REMOTE_CONTROL_PROVIDERS.has(session.provider)) {
+      const onRemoteControlChanged = (data: { sessionId?: string; status?: RemoteControlStatus }) => {
+        const rcSessionId = data?.sessionId || session.id;
+        if (!data?.status) return;
+        sendRemoteControlSnapshot(event, snapshotFromStatus(rcSessionId, data.status));
+      };
+      this.installListener(provider, 'remoteControl:changed', onRemoteControlChanged);
+
+      // A prompt sent from the phone while the session is idle runs as a turn.
+      const sessionStateManagerForRemote = getSessionStateManager();
+      const onRemoteControlTurnStarted = createRemoteControlWakeListener({
+        isSessionActive: (id) => sessionStateManagerForRemote.isSessionActive(id),
+        hasPendingRemoteTurn: (id) => hasPendingRemoteControlTurn(id),
+        startSession: (options) => sessionStateManagerForRemote.startSession(options),
+        endSession: (id) => sessionStateManagerForRemote.endSession(id),
+        turnWorkspacePath: () => effectiveWorkspacePath,
+        resolveOwnerWorkspacePath: getWorkspacePathForSession,
+        findWindow: (wakePath) => findWindowByWorkspace(wakePath),
+        sendMessage: async (targetWindow, message, wakeSessionId, wakePath, wakeContext) => {
+          if (!this.svc.sendMessageHandler) {
+            throw new Error('sendMessageHandler is not registered');
+          }
+          const mockEvent = {
+            sender: targetWindow.webContents,
+            senderFrame: targetWindow.webContents.mainFrame,
+          } as Electron.IpcMainInvokeEvent;
+          return this.svc.sendMessageHandler(mockEvent, message, wakeContext as any, wakeSessionId, wakePath);
+        },
+        defer: (fn) => { setImmediate(fn); },
+        delay: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+        logInfo: (message) => logger.main.info(message),
+        logWarn: (message) => logger.main.warn(message),
+        logError: (message, error) => logger.main.error(`${message}:`, error),
+      });
+      this.installListener(provider, 'remoteControl:turnStarted', onRemoteControlTurnStarted);
+
+      // The chip's mount-time pull can run before this provider existed;
+      // now that it does, push the snapshot that pull could not see.
+      sendRemoteControlSnapshot(event, getRemoteControlSnapshot(session.id, session.provider));
+    }
 
     // Forward any provider-side title updates to all renderers so the session
     // list updates in real time.

@@ -31,6 +31,7 @@ import type { TodoItem } from '@nimbalyst/runtime/ui/AgentTranscript/types';
 import { isToolLikeMessage } from '@nimbalyst/runtime/ui/AgentTranscript/utils/messageTypeHelpers';
 import type { AIInputRef } from './AIInput';
 import { SessionAIInput } from './SessionAIInput';
+import { remoteControlCommandFor, runRemoteControlCommand } from './remoteControlCommand';
 import { PromptQueueList } from './PromptQueueList';
 import { TranscriptEmbeddedFileCard } from './TranscriptEmbeddedFileCard';
 import { getDiffPeekSizeForInteractiveWidgetHost } from './interactiveWidgetHostProxy';
@@ -1199,6 +1200,19 @@ const LocalSessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscrip
         console.error('[SessionTranscript] Failed to submit claude-cli prompt:', error);
         blocked('cli_submit_failed');
       }
+      return;
+    }
+
+    // Remote Control (GH #1480): `/rc` and `/remote-control` start or stop the
+    // bridge from the host and are never sent to the model. Checked before the
+    // queue so they also work while a turn runs.
+    const remoteControlCommand = remoteControlCommandFor(provider, currentDraftInput);
+    if (remoteControlCommand) {
+      setDraftInput('');
+      clearAIInputHistory(sessionId);
+      resetHistory(sessionId);
+      void runRemoteControlCommand({ sessionId, provider: provider!, workspacePath, command: remoteControlCommand });
+      blocked('slash_command_only');
       return;
     }
 

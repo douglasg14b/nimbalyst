@@ -142,6 +142,7 @@ import { shouldShowFirstLaunchOnboarding } from './utils/firstLaunchOnboarding';
 import { getAIProviderOverridesWithWorktreeFallback } from './utils/aiSettingsMerge';
 import { registerMCPConfigHandlers } from './ipc/MCPConfigHandlers';
 import { registerMcpSessionStatusHandlers } from './ipc/McpSessionStatusHandlers';
+import { registerRemoteControlHandlers } from './ipc/RemoteControlHandlers';
 import { getOpenCodeConfigService, registerOpenCodeConfigHandlers } from './ipc/OpenCodeConfigHandlers';
 import { createOpenCodeModelCatalogCacheKey } from './services/OpenCodeModelCatalogService';
 import { registerClaudeCodePluginHandlers } from './ipc/ClaudeCodePluginHandlers';
@@ -1803,6 +1804,7 @@ app.whenReady().then(async () => {
     registerSuperLoopHandlers();
     registerMCPConfigHandlers();
     registerMcpSessionStatusHandlers();
+    registerRemoteControlHandlers();
     registerOpenCodeConfigHandlers();
     registerClaudeCodePluginHandlers();
     const activeSqlite = database.getActiveSQLiteDatabase();

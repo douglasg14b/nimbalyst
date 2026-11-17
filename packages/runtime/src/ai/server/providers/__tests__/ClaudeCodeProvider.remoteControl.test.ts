@@ -489,8 +489,13 @@ describe('ClaudeCodeProvider with Remote Control on', () => {
     installQueries([first]);
     await firstTurnWithRemoteControl(provider, first);
 
+    const events: Array<{ status: { desired: boolean; state: string } }> = [];
+    provider.on('remoteControl:changed', (payload) => events.push(payload));
     provider.handOffRemoteControlForReplacement();
     provider.destroy();
+    // Replaced, not ended: the UI shows it wanted but down, not off.
+    expect(events.at(-1)?.status).toMatchObject({ desired: true, state: 'disconnected' });
+    expect(first.close).toHaveBeenCalled();
 
     const successor = await makeProvider();
     const replacement = liveQuery();

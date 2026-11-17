@@ -2435,7 +2435,25 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       this.discardParkedQuery('destroy');
       this.rcBridgeQuery = null;
       this.rcInfo = null;
-      this.setRemoteControlState('off', null);
+      const carried = this.rcSessionId ? remoteControlCarryOver.peek(this.rcSessionId) : undefined;
+      if (carried && this.rcSessionId) {
+        // Replaced, not ended (a model change): still wanted, down until the
+        // successor's first turn reattaches.
+        this.rcState = 'off';
+        this.rcError = null;
+        this.emit('remoteControl:changed', {
+          sessionId: this.rcSessionId,
+          status: {
+            desired: true,
+            state: 'disconnected',
+            sessionUrl: carried.sessionUrl ?? null,
+            name: carried.name ?? null,
+            error: null,
+          } satisfies RemoteControlStatus,
+        });
+      } else {
+        this.setRemoteControlState('off', null);
+      }
     }
 
     // Clean up permission service

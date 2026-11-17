@@ -144,7 +144,7 @@ export function getInteractiveToolSchemas(sessionId: string | undefined) {
 
 IMPORTANT: First call get_session_edited_files, cross-reference with git status, and include ALL session-edited files that have uncommitted changes — do not cherry-pick a subset.
 
-Relative paths target the session's checkout (its worktree when linked). Absolute paths may also target attached repositories. Files outside these roots are rejected. If the work lives in another worktree of the session's repository (listed by \`git worktree list\`), pass that worktree's absolute path as workingDirectory; all files must be in it, and the user always approves that commit by hand.
+Relative paths target the session's checkout (its worktree when linked). Absolute paths may also target attached repositories. Files outside these roots are rejected. If the work lives in another worktree of the session's repository (listed by \`git worktree list\`), pass that worktree's absolute path as workingDirectory; all files must be in it, and the user approves that commit by hand unless they have turned on auto-approval for commits into other worktrees.
 
 ONE REPOSITORY PER CALL. A commit cannot span repositories. If the files you are committing live in more than one repository (a workspace can have attached folders that are their own checkouts), call this tool once per repository — each call with only that repository's files and a commit message describing that repository's change. A call whose files span repositories is rejected.
 
@@ -591,14 +591,18 @@ async function runGitCommitProposal(
 
   // Decide before publishing: voice must never request approval for an automatic commit.
   let isAutoCommit = false;
+  let autoCommitOtherWorktrees = false;
   try {
     const aiSettingsStore = new Store({ name: "ai-settings" });
     isAutoCommit = aiSettingsStore.get("autoCommitEnabled", false) as boolean;
+    autoCommitOtherWorktrees = aiSettingsStore.get("autoCommitOtherWorktrees", false) === true;
   } catch {
     // If we can't read settings, fall through to manual mode
   }
-  // #1756: a commit into a sibling worktree is always approved by hand.
-  if (target.worktree) isAutoCommit = false;
+  // #1756: a commit into a sibling worktree is approved by hand unless the
+  // user also opted in to auto-approving those. The target was validated
+  // above as a registered worktree of this repo holding every file.
+  if (target.worktree && !autoCommitOtherWorktrees) isAutoCommit = false;
 
   // Persist the proposal to database for durability
   try {

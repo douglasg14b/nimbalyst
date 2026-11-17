@@ -333,6 +333,9 @@ export interface InteractiveWidgetHost {
    */
   autoCommitEnabled: boolean;
 
+  /** Whether auto-commit also covers commits into another worktree (#1756). Optional: desktop only. */
+  autoCommitOtherWorktreesEnabled?: boolean;
+
   /**
    * Set whether auto-commit is enabled.
    * Used by the widget to let users disable auto-commit after a successful commit.

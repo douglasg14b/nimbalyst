@@ -1305,6 +1305,27 @@ describe('GitCommitConfirmationWidget', () => {
     expect(screen.getByTestId('git-commit-widget').dataset.state).toBe(state);
   });
 
+  // Before the host's row lands, the fallback applies the host's rule: a
+  // sibling worktree needs both auto-approve settings.
+  it.each([
+    [true, false, 'pending'],
+    [true, true, 'committing'],
+    [false, true, 'pending'],
+  ])('falls back to the host rule for a sibling worktree (autoCommit=%s, otherWorktrees=%s)', async (autoCommit, otherWorktrees, state) => {
+    const { interactiveWidgetHostAtom } = await import('../../../../store/atoms/interactiveWidgetHost');
+    const testStore = createStore();
+    testStore.set(interactiveWidgetHostAtom('worktree-fallback'), {
+      autoCommitEnabled: autoCommit, autoCommitOtherWorktreesEnabled: otherWorktrees, gitCommit: vi.fn(), trackEvent: vi.fn(),
+    } as unknown as import('../CustomToolWidgets/InteractiveWidgetHost').InteractiveWidgetHost);
+    const message = makeToolMessage('git_commit_proposal', {
+      commitMessage: 'fix: x', filesToStage: ['file.ts'], targetWorktree: { path: '/sibling', branch: 'feature' },
+    });
+    render(<JotaiProvider store={testStore}>
+      <GitCommitConfirmationWidget message={message} isExpanded={false} onToggle={() => {}} sessionId="worktree-fallback" />
+    </JotaiProvider>);
+    expect(screen.getByTestId('git-commit-widget').dataset.state).toBe(state);
+  });
+
   it('sends cancel through the interactive host', async () => {
     const { interactiveWidgetHostAtom } = await import('../../../../store/atoms/interactiveWidgetHost');
 

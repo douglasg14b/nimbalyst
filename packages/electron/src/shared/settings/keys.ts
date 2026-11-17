@@ -220,6 +220,13 @@ export const SETTINGS_REGISTRY = {
     { store: 'ai-settings', path: 'autoCommitEnabled' },
     false,
   ),
+  // Also auto-approve commits into another registered worktree of the
+  // session's repository (#1756 otherwise always asks). Needs autoCommitEnabled.
+  'ai.autoCommitOtherWorktrees': setting(
+    z.boolean(),
+    { store: 'ai-settings', path: 'autoCommitOtherWorktrees' },
+    false,
+  ),
   'ai.usageLimitAutoResumeEnabled': setting(
     z.boolean(),
     { store: 'ai-settings', path: 'usageLimitAutoResumeEnabled' },

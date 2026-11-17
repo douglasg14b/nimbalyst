@@ -757,6 +757,7 @@ const LocalSessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscrip
   const autoCommitEnabled = useAtomValue(autoCommitEnabledAtom);
   const setAutoCommitEnabled = useSetAtom(setAutoCommitEnabledAtom);
   const usageLimitAutoResumeEnabled = useAtomValue(settingAtom('ai.usageLimitAutoResumeEnabled'));
+  const autoCommitOtherWorktreesEnabled = useAtomValue(settingAtom('ai.autoCommitOtherWorktrees')) as boolean;
 
   // Diff peek popover size (shared with git extension)
   const diffPeekSize = useAtomValue(diffPeekSizeAtom);
@@ -1938,6 +1939,7 @@ const LocalSessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscrip
 
       // Auto-commit
       autoCommitEnabled,
+      autoCommitOtherWorktreesEnabled,
       setAutoCommitEnabled: (enabled: boolean) => {
         setAutoCommitEnabled(enabled);
       },
@@ -2210,6 +2212,7 @@ const LocalSessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscrip
       get workspacePath() { return liveHostRef.current?.workspacePath ?? (workspacePath || ''); },
       get worktreeId() { return liveHostRef.current?.worktreeId ?? worktreeId; },
       get autoCommitEnabled() { return liveHostRef.current?.autoCommitEnabled ?? false; },
+      get autoCommitOtherWorktreesEnabled() { return liveHostRef.current?.autoCommitOtherWorktreesEnabled ?? false; },
       get usageLimitAutoResumeEnabled() { return liveHostRef.current?.usageLimitAutoResumeEnabled ?? false; },
       get diffPeekSize() { return getDiffPeekSizeForInteractiveWidgetHost(liveHostRef.current); },
       askUserQuestionSubmit: (...args) => liveHostRef.current!.askUserQuestionSubmit(...args),

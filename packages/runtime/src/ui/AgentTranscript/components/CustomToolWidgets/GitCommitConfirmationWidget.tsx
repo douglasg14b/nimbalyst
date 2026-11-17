@@ -911,7 +911,9 @@ export const GitCommitConfirmationWidget: React.FC<CustomToolWidgetProps> = ({
   // preference predicate covers only the moment before the host row lands.
   const hostAutoApproved: boolean | undefined =
     typeof args.autoApproved === 'boolean' ? args.autoApproved : undefined;
-  const autoApproved = hostAutoApproved ?? (!!host?.autoCommitEnabled && !targetWorktree);
+  // Same rule as the host: a sibling worktree needs the second setting too.
+  const autoApproved = hostAutoApproved
+    ?? (!!host?.autoCommitEnabled && (!targetWorktree || !!host?.autoCommitOtherWorktreesEnabled));
   if (autoApproved && !isCommitting) {
     return (
       <div data-testid="git-commit-widget" data-state="committing"

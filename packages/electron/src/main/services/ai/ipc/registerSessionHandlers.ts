@@ -19,6 +19,7 @@ import { type AIProviderType, type DocumentContext, type Message, type SessionTy
 import * as fs from 'fs';
 import { remoteSessions } from '../remoteSessions';
 import { registerRemoteSessionHandlers } from './registerRemoteSessionHandlers';
+import { forgetRemoteControlForSession } from '../../../ipc/RemoteControlHandlers';
 
 /**
  * Session CRUD and the send-message entry point.
@@ -495,6 +496,7 @@ export function registerSessionHandlers(ctx: AIServiceContext): void {
     // Clean up provider if it exists
     if (success) {
       ProviderFactory.destroyProvider(sessionId);
+      forgetRemoteControlForSession(sessionId);
       // Clean up document state tracking
       ctx.documentContextService.clearSessionState(sessionId);
       // Clean up the agent file watcher if one was active.

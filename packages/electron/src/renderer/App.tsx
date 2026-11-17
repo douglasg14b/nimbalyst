@@ -131,6 +131,7 @@ import { initGeminiUsageListeners } from './store/listeners/geminiUsageListeners
 import { initFileOpenListeners } from './store/listeners/fileOpenListeners';
 import { initFileChangeListeners } from './store/listeners/fileChangeListeners';
 import { initMcpListeners } from './store/listeners/mcpListeners';
+import { initRemoteControlListeners } from './store/listeners/remoteControlListeners';
 import { initMenuCommandListeners } from './store/listeners/menuCommandListeners';
 import { initNetworkAvailabilityListeners } from './store/listeners/networkAvailabilityListeners';
 import { initTeamInboxListeners } from './store/listeners/teamInboxListeners';
@@ -443,6 +444,7 @@ export default function App() {
     const cleanupFileOpen = initFileOpenListeners();
     const cleanupFileChange = initFileChangeListeners();
     const cleanupMcp = initMcpListeners();
+    const cleanupRemoteControl = initRemoteControlListeners();
     const cleanupMenuCommand = initMenuCommandListeners();
     const cleanupNotification = initNotificationListeners();
     const cleanupExtensionPermission = initExtensionPermissionListeners();
@@ -501,6 +503,7 @@ export default function App() {
       cleanupFileOpen();
       cleanupFileChange?.();
       cleanupMcp?.();
+      cleanupRemoteControl?.();
       cleanupMenuCommand?.();
       cleanupNotification?.();
       cleanupExtensionPermission?.();

@@ -31,6 +31,7 @@ import { externalIdentityForSession } from '../services/externalSessions/Externa
 import { isLocalWikiItemId } from '../services/localWiki/localWikiItemIds';
 import { createTrailingSingleFlight } from '../utils/asyncCache';
 import { createUncommittedSessionLookup } from './uncommittedSessionLookup';
+import { forgetRemoteControlForSession, handOffRemoteControlBeforeProviderReplacement } from './RemoteControlHandlers';
 
 // Several listeners refresh the list on one event; eight identical calls in the
 // same millisecond each materialized every session row before the OOM abort.
@@ -205,6 +206,7 @@ export async function registerSessionHandlers() {
     // Delete session
     safeHandle('session:delete', async (event, sessionId: string) => {
         ProviderFactory.destroyProvider(sessionId);
+        forgetRemoteControlForSession(sessionId);
         await sessionManager.deleteSession(sessionId);
     });
 
@@ -264,6 +266,9 @@ export async function registerSessionHandlers() {
             }
 
             if (updates.model) {
+                // Remote Control survives the switch: the replacement provider
+                // reattaches to the same bridge on its first turn (GH #1480).
+                handOffRemoteControlBeforeProviderReplacement(sessionId);
                 // Invalidate the cached provider so it gets re-created with the new model
                 // on the next message. This ensures model changes take effect immediately.
                 if (providerType) {
@@ -702,6 +707,7 @@ export async function registerSessionHandlers() {
         try {
             // Destroy any active provider (aborts lead query and kills all teammates)
             ProviderFactory.destroyProvider(sessionId);
+            forgetRemoteControlForSession(sessionId);
 
             const session = await AISessionsRepository.get(sessionId);
             // GitHub #1825: record before removing the row, so the external-session

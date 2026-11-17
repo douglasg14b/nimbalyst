@@ -27,6 +27,7 @@ import {
 } from '@nimbalyst/runtime/ai/modelConstants';
 import { AnalyticsService } from '../services/analytics/AnalyticsService';
 import { archiveWorktree } from './WorktreeHandlers';
+import { remoteControlCarryOver } from '@nimbalyst/runtime/ai/server/providers/claudeCode/remoteControl';
 import type { BlitzCreateResult, WorktreeCreateResult } from '../../shared/ipc/types';
 
 const logger = log.scope('BlitzHandlers');
@@ -481,6 +482,9 @@ export function registerBlitzHandlers(): void {
 
       // Archive the blitz session itself
       await AISessionsRepository.updateMetadata(blitzId, { isArchived: true });
+      // Children went through archiveWorktree; the blitz session itself keeps no
+      // Remote Control hand-off either (GH #1480).
+      remoteControlCarryOver.clear(blitzId);
 
       if (errors.length > 0) {
         logger.warn('Blitz archived with some worktree failures', { blitzId, errors });

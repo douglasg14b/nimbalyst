@@ -36,7 +36,12 @@ import {
 import { ClaudeCodeDeps } from './dependencyInjection';
 import { resolveEffectiveSessionMode } from './resolveEffectiveSessionMode';
 import { ClaudeCodeTranscriptAdapter } from './ClaudeCodeTranscriptAdapter';
-import { buildSdkOptions, type BuildSdkOptionsDeps, type BuildSdkOptionsResult } from './sdkOptionsBuilder';
+import {
+  buildSdkOptions,
+  type BuildSdkOptionsDeps,
+  type BuildSdkOptionsParams,
+  type BuildSdkOptionsResult,
+} from './sdkOptionsBuilder';
 import { BUILTIN_TOOL_NAMES } from '@anthropic-ai/claude-agent-sdk';
 import { metaAgentBlockedNativeTools } from './toolPolicy';
 import type { TurnState } from './turnState';
@@ -249,6 +254,8 @@ export interface TurnQuerySetup extends BuildSdkOptionsResult {
   queryStartTime: number;
   /** True when the meta-agent tool restrictions were applied. */
   isMetaAgent: boolean;
+  /** The inputs `buildSdkOptions` ran with; Remote Control rebuilds a warm query from them. */
+  sdkOptionsParams: BuildSdkOptionsParams;
 }
 
 /**
@@ -352,6 +359,21 @@ export async function buildTurnQuery(
   }
 
   // Build SDK options (settings, MCP config, env, session resumption, prompt input)
+  const sdkOptionsParams: BuildSdkOptionsParams = {
+    message: state.message,
+    workspacePath,
+    sessionId,
+    documentContext,
+    settingsEnv,
+    shellEnv,
+    systemPrompt,
+    currentMode: host.currentMode,
+    imageContentBlocks: prepared.imageContentBlocks,
+    documentContentBlocks: prepared.documentContentBlocks,
+    permissionsPath: paths.permissionsPath,
+    mcpConfigWorkspacePath: paths.mcpConfigWorkspacePath,
+    isMetaAgent,
+  };
   const sdkResult = await buildSdkOptions(
     {
       resolveModelVariant: () => host.resolveModelVariant(),
@@ -363,21 +385,7 @@ export async function buildTurnQuery(
       config: host.config,
       abortController: host.abortController,
     },
-    {
-      message: state.message,
-      workspacePath,
-      sessionId,
-      documentContext,
-      settingsEnv,
-      shellEnv,
-      systemPrompt,
-      currentMode: host.currentMode,
-      imageContentBlocks: prepared.imageContentBlocks,
-      documentContentBlocks: prepared.documentContentBlocks,
-      permissionsPath: paths.permissionsPath,
-      mcpConfigWorkspacePath: paths.mcpConfigWorkspacePath,
-      isMetaAgent,
-    }
+    sdkOptionsParams,
   );
   host.publishSdkResult(sdkResult);
   const { options } = sdkResult;
@@ -386,10 +394,7 @@ export async function buildTurnQuery(
   // Meta-agent: the profile-specific MCP map was frozen by buildSdkOptions
   // through getMcpServersSnapshot; only native-tool restrictions remain here.
   if (isMetaAgent) {
-    const blockedNativeTools = metaAgentBlockedNativeTools(host.metaAgentAllowedTools, BUILTIN_TOOL_NAMES);
-    (options as any).allowedTools = host.metaAgentAllowedTools;
-    (options as any).disallowedTools = blockedNativeTools;
-    (options as any).blockedTools = blockedNativeTools;
+    applyMetaAgentToolRestrictions(options, host.metaAgentAllowedTools);
   }
 
   const queryStartTime = Date.now();
@@ -470,5 +475,13 @@ export async function buildTurnQuery(
     }
   };
 
-  return { ...sdkResult, transcriptAdapter, queryStartTime, isMetaAgent };
+  return { ...sdkResult, transcriptAdapter, queryStartTime, isMetaAgent, sdkOptionsParams };
+}
+
+/** The meta-agent's native-tool restrictions, applied to a built options object. */
+export function applyMetaAgentToolRestrictions(options: BuildSdkOptionsResult['options'], allowedTools: readonly string[]): void {
+  const blockedNativeTools = metaAgentBlockedNativeTools(allowedTools, BUILTIN_TOOL_NAMES);
+  (options as any).allowedTools = allowedTools;
+  (options as any).disallowedTools = blockedNativeTools;
+  (options as any).blockedTools = blockedNativeTools;
 }

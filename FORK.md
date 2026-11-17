@@ -42,6 +42,12 @@ The fork's footprint in upstream files is kept to a few one-line hooks. Everythi
 | `packages/electron/src/renderer/components/GlobalSettings/panels/AdvancedPanel.tsx` | Shows a "Fork build" section (with the commit) instead of the Release Channel section. |
 | `packages/electron/build/normalize-extra-resources.js` | Windows build fix: a directory junction instead of a symlink, so the build works without Developer Mode or admin. Worth offering upstream. |
 
+The feature branches touch these upstream files too. They are kept small so they can go upstream as PRs, and the same conflict rules apply to them:
+
+| Branch | Upstream files touched |
+| --- | --- |
+| `fork/worktree-auto-commit` | `packages/electron/src/shared/settings/keys.ts` (the `ai.autoCommitOtherWorktrees` setting), `packages/electron/src/main/mcp/tools/interactiveToolHandlers.ts` (the `target.worktree` gate and the tool description), `packages/runtime/src/ui/AgentTranscript/components/CustomToolWidgets/GitCommitConfirmationWidget.tsx` (the widget's fallback), `.../CustomToolWidgets/InteractiveWidgetHost.ts` (one optional field), `packages/electron/src/renderer/components/UnifiedAI/SessionTranscript.tsx` (passes the setting to the widget host), `packages/electron/src/renderer/components/Settings/AgentFeaturesPanel.tsx` (the toggle), and the tests `gitCommitProposalTarget.test.ts` (in `src/main/mcp/__tests__`) and `TranscriptWidgets.test.tsx`. |
+
 New, fork-only files: `src/shared/forkBuild.ts`, `src/main/services/forkInertUpdater.ts`, `forkUpdateNotice.ts`, `forkUpdateStatus.ts`, `ForkBuildSection.tsx`, their tests, `scripts/fork/`, `.claude/commands/fork-update.md`, and this file.
 
 With the flag set, nothing can check, download or install from `nimbalyst/nimbalyst`: the startup and hourly checks, both "Check for Updates..." menu items, the `check-for-updates` / `download-update` / `quit-and-install` IPC, the `update-toast:*` handlers, `release-channel:set`, install-on-quit, and the cached installer in the official updater's cache folder all land on the stub. `resources/app-update.yml` names this fork instead of the official feed as a second line of defence.
@@ -88,7 +94,7 @@ It runs `sync-upstream.mjs` (fetch, fast-forward `main`, merge the newest stable
 
 ### Resolving conflicts
 
-If the merge stops, the script lists the conflicted files and leaves the merge in progress. Conflicts from the fork can only be in the upstream files in the table above. For each one:
+If the merge stops, the script lists the conflicted files and leaves the merge in progress. Conflicts from the fork can only be in the upstream files in the tables above. For each one:
 
 1. Take upstream's version of the code (`git checkout --theirs -- <file>` takes it wholesale).
 2. Re-apply the fork's hook. `git diff <previous upstream tag> fork/self-managed-install -- <file>` shows exactly what the fork added. In `autoUpdater.ts` that is the `const autoUpdater = isForkBuild() ? createInertUpdater() : electronAutoUpdater;` binding, the imports, and each `if (isForkBuild())` early return; in the other files, a few marked lines.

@@ -11,8 +11,15 @@ const installer = fileURLToPath(new URL('../install-git-hooks.mjs', import.meta.
 test('installs SSH keepalives for long hooks without replacing a custom transport', (t) => {
   const repo = mkdtempSync(path.join(tmpdir(), 'nim-hook-install-'));
   t.after(() => rmSync(repo, { recursive: true, force: true }));
+  const home = mkdtempSync(path.join(tmpdir(), 'nim-hook-home-'));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
-  env.GIT_CONFIG_GLOBAL = path.join(repo, 'global-config');
+  // Git before 2.32 ignores GIT_CONFIG_GLOBAL and reads $HOME/.gitconfig, so
+  // point both at the same sandboxed file.
+  env.HOME = home;
+  env.USERPROFILE = home;
+  env.XDG_CONFIG_HOME = path.join(home, '.config');
+  env.GIT_CONFIG_GLOBAL = path.join(home, '.gitconfig');
   env.GIT_CONFIG_SYSTEM = path.join(repo, 'missing-system-config');
   env.GIT_CEILING_DIRECTORIES = realpathSync(tmpdir());
   const git = (...args) => execFileSync('git', args, { cwd: repo, env, encoding: 'utf8' }).trim();

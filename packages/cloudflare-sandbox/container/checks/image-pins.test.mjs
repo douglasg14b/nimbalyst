@@ -188,7 +188,7 @@ test('staging a clean fixture succeeds and hashes file contents', () => {
   }
 });
 
-test('staging refuses a symlink rather than following it out of the allowlist', () => {
+test('staging refuses a symlink rather than following it out of the allowlist', (t) => {
   const tmp = mkdtempSync(path.join(os.tmpdir(), 'nimbalyst-stage-'));
   try {
     const repo = path.join(tmp, 'repo');
@@ -198,7 +198,17 @@ test('staging refuses a symlink rather than following it out of the allowlist', 
     // the link's own name ("index.ts") says nothing about that.
     const secret = path.join(tmp, 'outside-secret.txt');
     writeFileSync(secret, 'private');
-    symlinkSync(secret, path.join(repo, 'packages/node/src/linked.ts'));
+    try {
+      symlinkSync(secret, path.join(repo, 'packages/node/src/linked.ts'));
+    } catch (error) {
+      // Windows refuses file symlinks without Developer Mode or admin, and has
+      // no unprivileged equivalent; such a link cannot occur in that checkout.
+      if (process.platform === 'win32' && error.code === 'EPERM') {
+        t.skip('file symlinks need Developer Mode or admin on Windows');
+        return;
+      }
+      throw error;
+    }
 
     assert.throws(
       () => stageBuildContext({ repoRoot: repo, outDir: path.join(tmp, 'out') }),
@@ -227,7 +237,8 @@ test('staging refuses a symlinked ancestor directory, not just a symlinked file'
     writeFileSync(path.join(outside, 'scripts/add-node-extensions.mjs'), '// noop\n');
     writeFileSync(path.join(outside, 'package.json'), '{"name":"@fixture/runtime"}');
     rmSync(path.join(repo, 'packages/runtime'), { recursive: true, force: true });
-    symlinkSync(outside, path.join(repo, 'packages/runtime'));
+    // A junction on Windows: it needs no privilege, and lstat reports it as a symlink too.
+    symlinkSync(outside, path.join(repo, 'packages/runtime'), process.platform === 'win32' ? 'junction' : 'dir');
 
     assert.throws(
       () => stageBuildContext({ repoRoot: repo, outDir: path.join(tmp, 'out') }),

@@ -132,6 +132,7 @@ import {
   mapBridgeState,
   remoteControlCarryOver,
   remoteControlSpawnKey,
+  warmSpawnDocumentContext,
   replayingIterator,
   shouldParkForRemoteControl,
   type RemoteControlCarry,
@@ -243,6 +244,14 @@ function withRemoteControlTimeout<T>(promise: Promise<T>, message: string): Prom
     timer = setTimeout(() => reject(new Error(message)), REMOTE_CONTROL_REQUEST_TIMEOUT_MS);
   });
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+/** Thrown into a warm spawn that was cancelled; callers that cancelled it ignore it. */
+class RemoteControlWarmSpawnCancelled extends Error {
+  constructor() {
+    super('Remote Control was turned off.');
+    this.name = 'RemoteControlWarmSpawnCancelled';
+  }
 }
 
 export interface ScheduleWakeupRequest {
@@ -387,6 +396,9 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
   // A warm query being spawned to carry the bridge while idle.
   private rcWarmSpawn: Promise<void> | null = null;
   private rcWarmSpawnCancelled = false;
+  // The warm query's process while it starts up, before it is parked; held so
+  // cancelling the spawn (destroy, quit, disable, a turn starting) closes it.
+  private rcWarmQueryStarting: Query | null = null;
   private rcRestoreTimer: ReturnType<typeof setTimeout> | null = null;
   // Automatic idle restores since the last cleanly parked turn; bounds a crash loop.
   private rcRestoreAttempts = 0;
@@ -804,6 +816,8 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       cwd: workspacePath,
       permissionsPath: paths.permissionsPath,
       mcpConfigWorkspacePath: paths.mcpConfigWorkspacePath,
+      worktreePath: documentContext?.worktreePath,
+      voiceMode: (documentContext as any)?.isVoiceMode === true,
     });
     // A model switch replaces the provider; its successor reattaches (see remoteControl.ts).
     if (!this.rcDesired && sessionId && remoteControlCarryOver.peek(sessionId)) {
@@ -957,9 +971,18 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       if (!adopted) this.liveQueryModelVariant = this.resolveModelVariant();
       if (sessionId && workspacePath) {
         // What a Remote Control warm query is rebuilt from while the session is
-        // idle. A shallow copy without this turn's prompt and attachments.
+        // idle. Without this turn's prompt and attachments, and with only the
+        // one documentContext field a resumed spawn reads, so the open file's
+        // content is not kept alive. The system prompt and env maps are the
+        // provider's per-session values, shared by reference, not copies.
         this.lastSpawnContext = {
-          sdkOptionsParams: { ...sdkOptionsParams, message: '', imageContentBlocks: [], documentContentBlocks: [] },
+          sdkOptionsParams: {
+            ...sdkOptionsParams,
+            message: '',
+            imageContentBlocks: [],
+            documentContentBlocks: [],
+            documentContext: warmSpawnDocumentContext(sdkOptionsParams.documentContext),
+          },
           sessionId,
           workspacePath,
           permissionsPath: paths.permissionsPath,
@@ -2687,6 +2710,15 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
   }
 
   /**
+   * The transcript text of a remote turn still waiting for its wake, or null.
+   * The host runs it as its own turn before a local prompt when the wake could
+   * not (no window, a failed send, a session that read busy).
+   */
+  public getPendingRemoteControlTurnText(): string | null {
+    return this.parkedQuery?.remoteTurn?.text ?? null;
+  }
+
+  /**
    * Turn Remote Control on, or rename it when it is already on. Resolves once
    * the bridge is up (or, mid-turn setup, once it is requested); rejects with a
    * user-readable reason when it could not start.
@@ -2716,6 +2748,11 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
         await this.spawnRemoteControlWarmQuery();
       }
     } catch (error) {
+      if (error instanceof RemoteControlWarmSpawnCancelled) {
+        // Turned off meanwhile, or a turn started and its own process takes
+        // the bridge at its system/init. Neither is a failure to report.
+        return this.getRemoteControlStatus();
+      }
       const message = error instanceof Error ? error.message : String(error);
       // A first enable that failed leaves Remote Control off; a failed rename keeps it on.
       if (!wasDesired) this.rcDesired = false;
@@ -2801,7 +2838,20 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     wantRemoteTurn: boolean,
     sessionId: string | undefined,
   ): Promise<{ adopted: AdoptedQuery<Query, AgentToolHooks | null>; remoteTurn: boolean; remoteText: string | null } | null> {
-    if (this.rcWarmSpawn) await this.rcWarmSpawn.catch(() => {});
+    if (this.rcWarmSpawn && !this.parkedQuery) {
+      // A warm query is still starting. Never wait for it: that can take up
+      // to the 30s init timeout, and a turn waiting here has no abort
+      // controller yet, so Stop could not stop it. A local turn cancels the
+      // warm query and spawns its own, whose system/init takes the bridge. A
+      // remote-turn wake has nothing to run: no prompt reached a process that
+      // has not been parked.
+      if (!wantRemoteTurn) {
+        console.log('[CLAUDE-CODE] REMOTE_CONTROL: a turn started while the warm query was starting; replacing it with the turn\'s own process');
+        this.cancelRemoteControlWarmSpawn();
+        if (this.rcDesired) this.setRemoteControlState('connecting', null);
+      }
+      return null;
+    }
     const parked = this.parkedQuery;
     if (!parked) return null;
     if (wantRemoteTurn && !parked.remoteTurn) return null;
@@ -2990,7 +3040,10 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
           parked.preamble = [];
           // UNVERIFIED: the shape of a remote prompt on this stream has not been
           // observed yet. This line is how the first real one gets recorded.
-          console.log(`[CLAUDE-CODE] REMOTE_CONTROL: remote turn started (first chunk ${describeChunkShape(chunk)}; prompt text ${classified.text ? 'found' : 'not found, using a placeholder'})`);
+          // Known limitation: any assistant or stream_event chunk while parked is
+          // taken as a phone turn, so output the CLI produced on its own (a late
+          // background result, say) would start one too. Logged distinctly.
+          console.log(`[CLAUDE-CODE] REMOTE_CONTROL: remote turn started (first chunk ${describeChunkShape(chunk)}; prompt text ${classified.text ? 'found' : 'not found, using a placeholder; started on output with no prompt seen, which may not be a phone prompt'})`);
           parked.remoteTurn = { text: classified.text ?? REMOTE_CONTROL_PLACEHOLDER_PROMPT, promptText: classified.text };
           this.emit('remoteControl:turnStarted', {
             sessionId: parked.sessionId ?? this.rcSessionId,
@@ -3039,6 +3092,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       this.rcRestoreAttempts++;
       console.log('[CLAUDE-CODE] REMOTE_CONTROL: restoring the bridge on an idle warm query');
       this.spawnRemoteControlWarmQuery().catch((error) => {
+        if (error instanceof RemoteControlWarmSpawnCancelled) return;
         const message = error instanceof Error ? error.message : String(error);
         console.warn('[CLAUDE-CODE] REMOTE_CONTROL: idle restore failed:', message);
         if (this.rcDesired) this.setRemoteControlState('disconnected', `Reconnects on this session's next message. (${message})`);
@@ -3056,7 +3110,20 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
   }
 
   private cancelRemoteControlWarmSpawn(): void {
-    if (this.rcWarmSpawn) this.rcWarmSpawnCancelled = true;
+    if (!this.rcWarmSpawn) return;
+    this.rcWarmSpawnCancelled = true;
+    // Still starting: nobody else holds this process, so close it now rather
+    // than when its init settles (up to the 30s timeout).
+    const starting = this.rcWarmQueryStarting;
+    this.rcWarmQueryStarting = null;
+    if (starting) {
+      try {
+        starting.close();
+        console.log('[CLAUDE-CODE] REMOTE_CONTROL: closed a warm query that was still starting');
+      } catch (error) {
+        console.warn('[CLAUDE-CODE] REMOTE_CONTROL: closing a starting warm query failed:', error);
+      }
+    }
   }
 
   /**
@@ -3106,10 +3173,12 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       const trimmed = data.trim();
       if (trimmed) console.warn(`[CLAUDE-CODE-STDERR] ${trimmed.substring(0, 300)}`);
     };
-    if (cancelled()) throw new Error('Remote Control was turned off.');
+    if (cancelled()) throw new RemoteControlWarmSpawnCancelled();
 
     const stream = createPersistentPromptStream(null);
     const warm = query({ prompt: stream.iterable as any, options: sdk.options }) as unknown as Query;
+    this.rcWarmQueryStarting = warm;
+    let wasParked = false;
     const parked: ParkedRemoteControlQuery = {
       adopted: {
         query: warm,
@@ -3132,17 +3201,23 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       if (typeof warm.initializationResult === 'function') {
         await withRemoteControlTimeout(warm.initializationResult(), 'Claude Code did not start in time.');
       }
-      if (cancelled()) throw new Error('Remote Control was turned off.');
+      if (cancelled()) throw new RemoteControlWarmSpawnCancelled();
+      if (this.rcWarmQueryStarting === warm) this.rcWarmQueryStarting = null;
       this.parkedQuery = parked;
+      wasParked = true;
       this.liveQueryModelVariant = parked.modelVariant;
       this.startParkedPump(parked);
       await this.attachRemoteControlBridge(warm);
       if (this.rcBridgeQuery !== warm) throw new Error(this.rcError ?? 'Remote Control did not start.');
       console.log('[CLAUDE-CODE] REMOTE_CONTROL: bridge is up on an idle warm query');
     } catch (error) {
+      if (this.rcWarmQueryStarting === warm) this.rcWarmQueryStarting = null;
+      // Once parked, a turn may have adopted the process while the bridge was
+      // still attaching; that turn owns it now and it must not be closed here.
+      const adoptedByTurn = wasParked && this.parkedQuery !== parked && !this.rcEndedQueries.has(warm);
       if (this.parkedQuery === parked) this.parkedQuery = null;
-      this.closeParkedQuery(parked, 'warm-query-failed');
-      throw error;
+      if (!adoptedByTurn) this.closeParkedQuery(parked, 'warm-query-failed');
+      throw cancelled() ? new RemoteControlWarmSpawnCancelled() : error;
     }
   }
 

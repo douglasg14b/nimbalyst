@@ -31,6 +31,7 @@ vi.mock('../../utils/ipcRegistry', () => ({
 }));
 
 import {
+  createRemoteControlSnapshotPusher,
   getRemoteControlSnapshot,
   persistRemoteControlNotice,
   remoteControlNoticeText,
@@ -166,5 +167,58 @@ describe('the /rc transcript notice', () => {
     expect(remoteControlNoticeText('enable', { success: true, snapshot })).toContain(READY.sessionUrl);
     expect(remoteControlNoticeText('enable', { success: false, snapshot, error: 'boom' })).toBe('Remote Control could not start: boom');
     expect(remoteControlNoticeText('disable', { success: true, snapshot })).toBe('Remote Control is off.');
+  });
+});
+
+describe('createRemoteControlSnapshotPusher', () => {
+  const offSnapshot = { sessionId: 's1', supported: true, active: true, ...OFF };
+  const readySnapshot = { sessionId: 's1', supported: true, active: true, ...READY };
+
+  function pusherWith(resolveWorkspacePath: (id: string) => Promise<string | null> = async () => '/repo') {
+    const sent: unknown[] = [];
+    const logWarn = vi.fn();
+    const push = createRemoteControlSnapshotPusher({
+      resolveWorkspacePath,
+      sendToWorkspace: (_path, payload) => { sent.push(payload); return true; },
+      logWarn,
+    });
+    return { push, sent, logWarn, fallback: vi.fn() };
+  }
+
+  // Every claude-code turn pushes the current snapshot; with Remote Control
+  // off it is the same snapshot every time and must not re-render anything.
+  it('drops a per-turn push the renderer already has', async () => {
+    const { push, sent, fallback } = pusherWith();
+    await push(offSnapshot, { onlyIfChanged: true, fallback });
+    await push(offSnapshot, { onlyIfChanged: true, fallback });
+    await push(offSnapshot, { onlyIfChanged: true, fallback });
+    expect(sent).toHaveLength(1);
+  });
+
+  it('never lets a snapshot that resolved late overwrite a newer one', async () => {
+    let releaseFirst!: (path: string) => void;
+    let calls = 0;
+    const { push, sent, fallback } = pusherWith((() => {
+      calls++;
+      return calls === 1 ? new Promise<string>((resolve) => { releaseFirst = resolve; }) : Promise.resolve('/repo');
+    }) as never);
+
+    const older = push(readySnapshot, { fallback });
+    await push(offSnapshot, { fallback });
+    releaseFirst('/repo');
+    await older;
+
+    expect(sent).toEqual([{ ...offSnapshot, workspacePath: '/repo' }]);
+  });
+
+  it('logs a send to a disposed frame instead of rejecting', async () => {
+    const logWarn = vi.fn();
+    const push = createRemoteControlSnapshotPusher({
+      resolveWorkspacePath: async () => null,
+      sendToWorkspace: () => true,
+      logWarn,
+    });
+    await expect(push(offSnapshot, { fallback: () => { throw new Error('Render frame was disposed'); } })).resolves.toBeUndefined();
+    expect(logWarn).toHaveBeenCalled();
   });
 });

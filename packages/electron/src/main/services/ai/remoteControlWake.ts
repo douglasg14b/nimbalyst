@@ -65,8 +65,9 @@ export function createRemoteControlWakeListener<W extends WakeTargetWindow>(deps
 
     for (let attempt = 0; deps.isSessionActive(sessionId); attempt++) {
       if (attempt >= REMOTE_WAKE_SETTLE_ATTEMPTS) {
-        // A turn is running on this session; it reads the stream itself.
-        deps.logInfo(`[AIService] Remote Control prompt for ${sessionId} arrived while a turn is running; that turn owns it`);
+        // The prompt stays pending on the parked process; the session's next
+        // prompt runs it first, as its own turn (runStrandedRemoteControlTurn).
+        deps.logInfo(`[AIService] Remote Control prompt for ${sessionId} arrived while the session still read as busy; left pending for the session's next prompt to run first`);
         return;
       }
       await deps.delay(REMOTE_WAKE_SETTLE_INTERVAL_MS);
@@ -101,4 +102,43 @@ export function createRemoteControlWakeListener<W extends WakeTargetWindow>(deps
       abandon('[AIService] Failed to handle a Remote Control prompt', error);
     }
   };
+}
+
+export interface StrandedRemoteTurnDeps {
+  isSessionActive: (sessionId: string) => boolean;
+  /** The transcript text of a remote turn still waiting on the parked process, or null. */
+  pendingRemoteTurnText: (sessionId: string) => string | null;
+  /** Run it as its own turn (a send flagged with the remote prompt origin); resolves when it ends. */
+  runRemoteTurn: (text: string) => Promise<unknown>;
+  logInfo: (message: string) => void;
+  logError: (message: string, error: unknown) => void;
+}
+
+/**
+ * Called before a local prompt is sent. When a remote turn's wake could not run
+ * (no window, a failed send, a session that read busy), the parked process is
+ * already answering the phone's prompt. Sending the local prompt onto it would
+ * pull that answer into the local turn and leave the local answer to show up
+ * later as a phantom remote turn. So the remote turn runs first, as its own
+ * turn with its own user row, and the local prompt follows it.
+ *
+ * Skipped when the session is active: a wake (or another turn) is already in
+ * flight and owns the parked process.
+ */
+export async function runStrandedRemoteControlTurn(
+  sessionId: string,
+  promptOrigin: unknown,
+  deps: StrandedRemoteTurnDeps,
+): Promise<void> {
+  if (promptOrigin === REMOTE_CONTROL_PROMPT_ORIGIN) return;
+  if (deps.isSessionActive(sessionId)) return;
+  const text = deps.pendingRemoteTurnText(sessionId);
+  if (text === null) return;
+  deps.logInfo(`[AIService] Running a pending Remote Control prompt for ${sessionId} before the local prompt`);
+  try {
+    await deps.runRemoteTurn(text);
+  } catch (error) {
+    // The local prompt still runs; the provider then reports the mixed turn.
+    deps.logError('[AIService] Failed to run a pending Remote Control prompt before a local one', error);
+  }
 }

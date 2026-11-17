@@ -120,7 +120,10 @@ const answer = (id: string, text: string) => [
  * does, yields whatever the test sends, and ends its iterator when closed or
  * when the prompt stream ends (the real CLI exits ~1.2s after stdin closes).
  */
-function liveQuery(bridge = { session_url: 'https://claude.ai/code/session_test', bridge_session_id: 'cse_test' }) {
+function liveQuery(
+  bridge = { session_url: 'https://claude.ai/code/session_test', bridge_session_id: 'cse_test' },
+  opts: { init?: Promise<unknown> } = {},
+) {
   const outbox: unknown[] = [];
   let wake: (() => void) | null = null;
   let finished = false;
@@ -144,7 +147,7 @@ function liveQuery(bridge = { session_url: 'https://claude.ai/code/session_test'
     },
     interrupt: async () => {},
     streamInput: async () => {},
-    initializationResult: async () => ({}),
+    initializationResult: async () => (opts.init ? await opts.init : {}),
     setPermissionMode,
     enableRemoteControl,
     close,
@@ -218,6 +221,17 @@ describe('ClaudeCodeProvider with Remote Control off', () => {
     await runTurn(provider, 'again');
     expect(queryMock).toHaveBeenCalledTimes(2);
     await waitFor(() => second.promptStreamEnded);
+  });
+
+  it('keeps nothing of the open file once the turn is over', async () => {
+    const provider = await makeProvider();
+    const [live] = installQueries([liveQuery()]);
+    live.send(...answer('msg_1', 'hello'));
+
+    await runTurn(provider, 'hi', undefined, { mode: 'agent', content: 'OPEN FILE BODY', filePath: '/a.md' });
+
+    const kept = (provider as unknown as { lastSpawnContext: unknown }).lastSpawnContext;
+    expect(JSON.stringify(kept)).not.toContain('OPEN FILE BODY');
   });
 
   it('skips a remote-turn wake without spawning anything when no remote turn is pending', async () => {
@@ -372,6 +386,61 @@ describe('ClaudeCodeProvider with Remote Control on', () => {
     expect(options.resume).toBe('sdk-session-1');
   });
 
+  /** A plain first turn, then enable at idle with a warm query whose init only settles on release. */
+  async function enableAtIdleWithSlowWarmQuery() {
+    const provider = await makeProvider();
+    let releaseInit!: () => void;
+    const first = liveQuery();
+    const warm = liveQuery(undefined, { init: new Promise<void>((resolve) => { releaseInit = resolve; }) });
+    const lives = installQueries([first, warm]);
+    first.send(...answer('msg_1', 'hello'));
+    await runTurn(provider, 'hi');
+    await waitFor(() => first.promptStreamEnded);
+    const enabling = provider.enableRemoteControl();
+    enabling.catch(() => {});
+    await waitFor(() => queryMock.mock.calls.length === 2);
+    return { provider, warm, lives, enabling, releaseInit };
+  }
+
+  // Stop during the first second of a turn that raced an idle enable: the turn
+  // used to wait on the warm query with no abort controller of its own, then
+  // run the stopped prompt on a fresh process once the warm query gave up.
+  it('lets Stop stop a turn that started while a warm query was starting, and never runs its prompt afterwards', async () => {
+    const { provider, warm, lives, enabling, releaseInit } = await enableAtIdleWithSlowWarmQuery();
+    const third = liveQuery();
+    lives[2] = third;
+    third.send(...answer('msg_2', 'ran'));
+    const deliveries = () => lives.filter(Boolean).flatMap((live) => live.prompts)
+      .filter((prompt) => (prompt as { message?: { content?: unknown } }).message?.content === 'local').length;
+
+    const turn = runTurn(provider, 'local');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const deliveredAtStop = deliveries();
+    provider.abort();
+    releaseInit();
+    await turn;
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    // Whatever ran, ran before Stop; nothing was sent after it.
+    expect(deliveries()).toBe(deliveredAtStop);
+    // The starting warm query was closed, not left to finish its init.
+    expect(warm.close).toHaveBeenCalled();
+    // Not a failure: the turn's own process carries the bridge.
+    await expect(enabling).resolves.toMatchObject({ desired: true });
+    await provider.disableRemoteControl();
+  });
+
+  // The warm query exists only as a starting process until its init settles
+  // (up to 30s). Destroy (and quit, and disable) must close it right away.
+  it('closes a warm query that is still starting when the provider is destroyed', async () => {
+    const { provider, warm, releaseInit } = await enableAtIdleWithSlowWarmQuery();
+
+    provider.destroy();
+
+    expect(warm.close).toHaveBeenCalled();
+    releaseInit();
+  });
+
   it('runs a prompt sent from the phone as a turn on the parked query, without pushing it or persisting its echo', async () => {
     const provider = await makeProvider();
     const [live] = installQueries([liveQuery()]);
@@ -408,6 +477,36 @@ describe('ClaudeCodeProvider with Remote Control on', () => {
     // And the query is parked again for the next one.
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(live.promptStreamEnded).toBe(false);
+  });
+
+  // The host sequence when the wake could not run: the next local prompt first
+  // runs the pending remote turn as its own turn, then sends itself. Each answer
+  // lands under its own prompt and nothing is left to start a phantom turn.
+  it('exposes a stranded remote turn so the host can run it before a local prompt, keeping each answer with its prompt', async () => {
+    const provider = await makeProvider();
+    const [live] = installQueries([liveQuery()]);
+    await firstTurnWithRemoteControl(provider, live);
+    const started: unknown[] = [];
+    provider.on('remoteControl:turnStarted', (payload) => started.push(payload));
+
+    live.send({ type: 'user', message: { role: 'user', content: 'from phone' }, parent_tool_use_id: null });
+    await waitFor(() => started.length === 1);
+    expect(provider.getPendingRemoteControlTurnText()).toBe('from phone');
+
+    // No wake ran. The local prompt arrives; the host runs the remote turn first.
+    const remoteTurn = runTurn(provider, 'from phone', undefined, { mode: 'agent', promptOrigin: 'remote_control' });
+    live.send(
+      { type: 'assistant', session_id: 'sdk-session-1', message: { id: 'msg_r', content: [{ type: 'text', text: 'phone answer' }] } },
+      { type: 'result', subtype: 'success', is_error: false, num_turns: 1 },
+    );
+    expect((await remoteTurn).filter((c) => c.type === 'text').map((c) => c.content)).toEqual(['phone answer']);
+    expect(provider.getPendingRemoteControlTurnText()).toBeNull();
+
+    const localTurn = runTurn(provider, 'local');
+    await answerAfterPrompt(live, 2, answer('msg_l', 'local answer'));
+    expect((await localTurn).filter((c) => c.type === 'text').map((c) => c.content)).toEqual(['local answer']);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(started).toHaveLength(1);
   });
 
   it('falls back to a placeholder prompt when the remote turn carries no readable text', async () => {

@@ -1,4 +1,6 @@
+// @vitest-environment node
 import { describe, expect, it, vi } from 'vitest';
+import { remoteControlCarryOver } from '@nimbalyst/runtime/ai/server/providers/claudeCode/remoteControl';
 import {
   archiveSessionsAndDestroyProviders,
   destroyProviderForArchivedSession,
@@ -84,5 +86,21 @@ describe('archive session provider lifecycle', () => {
       'ordinary-session',
       expect.any(Error),
     );
+  });
+
+  // A model change stashes a Remote Control hand-off for the next provider.
+  // Archiving before that turn must drop it, or unarchiving turns it back on.
+  it('drops a pending Remote Control hand-off for the archived session only', async () => {
+    remoteControlCarryOver.stash('archived', { name: 'laptop', bridgeSessionId: 'cse_a' });
+    remoteControlCarryOver.stash('other', { name: 'desk', bridgeSessionId: 'cse_b' });
+
+    await archiveSessionsAndDestroyProviders(['archived'], {
+      archiveSession: vi.fn(async () => {}),
+      destroyProvider: vi.fn(),
+    });
+
+    expect(remoteControlCarryOver.peek('archived')).toBeUndefined();
+    expect(remoteControlCarryOver.peek('other')).toBeDefined();
+    remoteControlCarryOver.clear('other');
   });
 });

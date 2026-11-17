@@ -60,12 +60,15 @@ import {
 import type { RemoteControlStatus } from '@nimbalyst/runtime/ai/server/providers/claudeCode/remoteControl';
 import {
   REMOTE_CONTROL_PROVIDERS,
+  createRemoteControlSnapshotPusher,
   getRemoteControlSnapshot,
   hasPendingRemoteControlTurn,
+  pendingRemoteControlTurnText,
   snapshotFromStatus,
   type RemoteControlSnapshot,
 } from '../../ipc/RemoteControlHandlers';
-import { createRemoteControlWakeListener } from './remoteControlWake';
+import { createRemoteControlWakeListener, runStrandedRemoteControlTurn } from './remoteControlWake';
+import { REMOTE_CONTROL_PROMPT_ORIGIN } from '@nimbalyst/runtime/ai/server/providers/claudeCode/remoteControl';
 import { toolRegistry } from './tools';
 import type { DriveReason } from './QueueDriveService';
 import { resolveExtensionAgentRef } from './providerResolution';
@@ -303,19 +306,30 @@ async function getWorkspacePathForSession(sessionId: string): Promise<string | n
   return null;
 }
 
+const pushRemoteControlSnapshot = createRemoteControlSnapshotPusher({
+  resolveWorkspacePath: getWorkspacePathForSession,
+  sendToWorkspace: (workspacePath, payload) => {
+    const targetWindow = findWindowByWorkspace(workspacePath);
+    if (!targetWindow || targetWindow.isDestroyed() || targetWindow.webContents.isDestroyed()) return false;
+    targetWindow.webContents.send('ai:remote-control:changed', payload);
+    return true;
+  },
+  logWarn: (message, error) => logger.main.warn(message, error),
+});
+
 /**
  * Push a Remote Control snapshot (GH #1480) to the window that owns the
  * session's workspace, falling back to the sender of the turn that installed
  * the listener. Idle-time transitions arrive long after that turn ended.
  */
-function sendRemoteControlSnapshot(event: Electron.IpcMainInvokeEvent, snapshot: RemoteControlSnapshot): void {
-  void getWorkspacePathForSession(snapshot.sessionId).then((workspacePath) => {
-    const targetWindow = workspacePath ? findWindowByWorkspace(workspacePath) : null;
-    if (targetWindow && !targetWindow.isDestroyed()) {
-      targetWindow.webContents.send('ai:remote-control:changed', { ...snapshot, workspacePath });
-    } else {
-      safeSend(event, 'ai:remote-control:changed', snapshot);
-    }
+function sendRemoteControlSnapshot(
+  event: Electron.IpcMainInvokeEvent,
+  snapshot: RemoteControlSnapshot,
+  onlyIfChanged = false,
+): void {
+  void pushRemoteControlSnapshot(snapshot, {
+    onlyIfChanged,
+    fallback: (payload) => { safeSend(event, 'ai:remote-control:changed', payload); },
   });
 }
 
@@ -454,6 +468,25 @@ export class MessageStreamingHandler {
       trackSendBlocked('no_workspace');
       throw new Error('No workspace path available - AI operations require an open workspace');
     }
+
+    // Remote Control (GH #1480): a phone prompt whose wake could not run is
+    // still pending on the parked process. Run it as its own turn first, so
+    // this prompt does not inherit its answer. A provider lookup and a null
+    // check when Remote Control is off.
+    const wakeWorkspacePath = workspacePath;
+    await runStrandedRemoteControlTurn(sessionId, (documentContext as any)?.promptOrigin, {
+      isSessionActive: (id) => getSessionStateManager().isSessionActive(id),
+      pendingRemoteTurnText: (id) => pendingRemoteControlTurnText(id, 'claude-code'),
+      runRemoteTurn: (text) => this.handle(
+        event,
+        text,
+        { promptOrigin: REMOTE_CONTROL_PROMPT_ORIGIN } as DocumentContext,
+        sessionId,
+        wakeWorkspacePath,
+      ),
+      logInfo: (logMessage) => logger.main.info(logMessage),
+      logError: (logMessage, error) => logger.main.error(`${logMessage}:`, error),
+    });
 
     const loadStartTime = Date.now();
     const session = await this.svc.sessionManager.loadSession(sessionId, workspacePath);
@@ -943,8 +976,9 @@ export class MessageStreamingHandler {
       this.installListener(provider, 'remoteControl:turnStarted', onRemoteControlTurnStarted);
 
       // The chip's mount-time pull can run before this provider existed;
-      // now that it does, push the snapshot that pull could not see.
-      sendRemoteControlSnapshot(event, getRemoteControlSnapshot(session.id, session.provider));
+      // now that it does, push the snapshot that pull could not see. Only when
+      // it differs from the last push: every turn runs this.
+      sendRemoteControlSnapshot(event, getRemoteControlSnapshot(session.id, session.provider), true);
     }
 
     // Forward any provider-side title updates to all renderers so the session

@@ -6,7 +6,12 @@
  * reads the stream.
  */
 import { describe, expect, it, vi } from 'vitest';
-import { createRemoteControlWakeListener, type RemoteControlWakeDeps } from '../remoteControlWake';
+import {
+  createRemoteControlWakeListener,
+  runStrandedRemoteControlTurn,
+  type RemoteControlWakeDeps,
+  type StrandedRemoteTurnDeps,
+} from '../remoteControlWake';
 
 function setup(overrides: Partial<RemoteControlWakeDeps> = {}) {
   const window = { isDestroyed: () => false };
@@ -62,5 +67,51 @@ describe('Remote Control wake', () => {
     const { deps, wake } = setup({ sendMessage: vi.fn(async () => { throw new Error('boom'); }) });
     await wake({ sessionId: 's1', text: 'from phone' });
     await vi.waitFor(() => expect(deps.endSession).toHaveBeenCalledWith('s1'));
+  });
+});
+
+/**
+ * A wake that could not run leaves the phone's prompt pending on the parked
+ * process. The next local prompt must not be sent on top of it: the remote turn
+ * runs first, as its own turn, so each answer lands under its own prompt.
+ */
+describe('runStrandedRemoteControlTurn', () => {
+  function strandedDeps(overrides: Partial<StrandedRemoteTurnDeps> = {}) {
+    const order: string[] = [];
+    const deps: StrandedRemoteTurnDeps = {
+      isSessionActive: () => false,
+      pendingRemoteTurnText: () => 'from phone',
+      runRemoteTurn: vi.fn(async (text: string) => { order.push(`remote:${text}`); }),
+      logInfo: () => {},
+      logError: () => {},
+      ...overrides,
+    };
+    return { deps, order };
+  }
+
+  it('runs a pending remote turn to completion before the local prompt', async () => {
+    const { deps, order } = strandedDeps();
+    await runStrandedRemoteControlTurn('s1', undefined, deps);
+    order.push('local');
+    expect(order).toEqual(['remote:from phone', 'local']);
+  });
+
+  it('does nothing when nothing is pending, for a remote send itself, or while a wake owns the session', async () => {
+    for (const [origin, overrides] of [
+      [undefined, { pendingRemoteTurnText: () => null }],
+      ['remote_control', {}],
+      [undefined, { isSessionActive: () => true }],
+    ] as const) {
+      const { deps } = strandedDeps(overrides);
+      await runStrandedRemoteControlTurn('s1', origin, deps);
+      expect(deps.runRemoteTurn).not.toHaveBeenCalled();
+    }
+  });
+
+  it('still lets the local prompt run when the remote turn fails', async () => {
+    const logError = vi.fn();
+    const { deps } = strandedDeps({ runRemoteTurn: vi.fn(async () => { throw new Error('boom'); }), logError });
+    await expect(runStrandedRemoteControlTurn('s1', undefined, deps)).resolves.toBeUndefined();
+    expect(logError).toHaveBeenCalled();
   });
 });

@@ -1,3 +1,5 @@
+import { remoteControlCarryOver } from '@nimbalyst/runtime/ai/server/providers/claudeCode/remoteControl';
+
 export interface ArchiveSessionProviderLifecycleDeps {
   archiveSession(sessionId: string): Promise<void>;
   destroyProvider(sessionId: string): void;
@@ -19,6 +21,9 @@ export function destroyProviderForArchivedSession(
   destroyProvider: (sessionId: string) => void,
   onProviderCleanupError?: (sessionId: string, error: unknown) => void,
 ): boolean {
+  // An archived session keeps no Remote Control hand-off (GH #1480): one stashed
+  // by a model change would otherwise turn it back on after unarchive.
+  remoteControlCarryOver.clear(sessionId);
   try {
     destroyProvider(sessionId);
     return true;

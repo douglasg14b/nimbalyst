@@ -47,6 +47,7 @@ interface RemoteControlCapableProvider {
   disableRemoteControl(): Promise<RemoteControlStatus>;
   getRemoteControlStatus(): RemoteControlStatus;
   hasPendingRemoteControlTurn?(): boolean;
+  getPendingRemoteControlTurnText?(): string | null;
   handOffRemoteControlForReplacement?(): void;
 }
 
@@ -112,6 +113,51 @@ export function snapshotFromStatus(sessionId: string, status: RemoteControlStatu
 export function hasPendingRemoteControlTurn(sessionId: string): boolean {
   const instance = capableProvider(sessionId, 'claude-code');
   return instance?.hasPendingRemoteControlTurn?.() === true;
+}
+
+/** The text of a remote turn still waiting for its wake, or null. Never creates a provider. */
+export function pendingRemoteControlTurnText(sessionId: string, provider: string): string | null {
+  return capableProvider(sessionId, provider)?.getPendingRemoteControlTurnText?.() ?? null;
+}
+
+export interface RemoteControlSnapshotPushDeps {
+  resolveWorkspacePath: (sessionId: string) => Promise<string | null>;
+  /** Send to the window owning the workspace; false when there is no live one. */
+  sendToWorkspace: (workspacePath: string, payload: unknown) => boolean;
+  logWarn: (message: string, error: unknown) => void;
+}
+
+/**
+ * Pushes snapshots to the renderer. Three guarantees: a snapshot resolved late
+ * never overwrites a newer one for the same session (the workspace lookup is
+ * async, so two pushes can settle out of order); `onlyIfChanged` pushes (the
+ * one every turn makes) are dropped when the renderer already has that exact
+ * snapshot, so a session with Remote Control off re-renders nothing per turn;
+ * and a send to a disposed frame is logged, never an unhandled rejection.
+ */
+export function createRemoteControlSnapshotPusher(deps: RemoteControlSnapshotPushDeps) {
+  let sequence = 0;
+  const latest = new Map<string, number>();
+  const lastSent = new Map<string, string>();
+  return (
+    snapshot: RemoteControlSnapshot,
+    options: { onlyIfChanged?: boolean; fallback: (payload: unknown) => void },
+  ): Promise<void> => {
+    const sessionId = snapshot.sessionId;
+    const mine = ++sequence;
+    latest.set(sessionId, mine);
+    return (async () => {
+      const workspacePath = await deps.resolveWorkspacePath(sessionId);
+      if (latest.get(sessionId) !== mine) return;
+      const key = JSON.stringify(snapshot);
+      if (options.onlyIfChanged && lastSent.get(sessionId) === key) return;
+      lastSent.set(sessionId, key);
+      const payload = workspacePath ? { ...snapshot, workspacePath } : snapshot;
+      if (!workspacePath || !deps.sendToWorkspace(workspacePath, payload)) options.fallback(payload);
+    })().catch((error) => {
+      deps.logWarn('[RemoteControl] Failed to push a snapshot', error);
+    });
+  };
 }
 
 /**

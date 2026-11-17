@@ -276,9 +276,12 @@ export function chunkShapeKey(chunk: unknown): string {
 }
 
 /**
- * Everything a parked process was spawned with that a later turn could change.
- * A turn whose key differs cannot reuse the process; it spawns its own and
- * reattaches the bridge to it.
+ * What a process was spawned with that a later turn could change. A turn whose
+ * key differs cannot reuse the process; it spawns its own and reattaches the
+ * bridge to it. The worktree path and voice mode shape the system prompt, which
+ * is fixed at spawn. Not in the key (known limitation): the agent role and
+ * workflow preset, read asynchronously later in the turn, and the MCP server
+ * set, which the provider freezes once anyway.
  */
 export function remoteControlSpawnKey(inputs: {
   modelVariant: string;
@@ -287,6 +290,8 @@ export function remoteControlSpawnKey(inputs: {
   cwd?: string;
   permissionsPath?: string;
   mcpConfigWorkspacePath?: string;
+  worktreePath?: string;
+  voiceMode?: boolean;
 }): string {
   return JSON.stringify([
     inputs.modelVariant,
@@ -295,7 +300,21 @@ export function remoteControlSpawnKey(inputs: {
     inputs.cwd ?? null,
     inputs.permissionsPath ?? null,
     inputs.mcpConfigWorkspacePath ?? null,
+    inputs.worktreePath ?? null,
+    inputs.voiceMode === true,
   ]);
+}
+
+/**
+ * The part of a turn's documentContext a warm spawn needs. It always resumes an
+ * existing conversation, so only the prompt provenance (which decides prompt
+ * suggestions) is read; the open file, selection and the rest are dropped so
+ * they are not kept alive between turns.
+ */
+export function warmSpawnDocumentContext(documentContext: unknown): { promptProvenance?: unknown } | undefined {
+  if (!documentContext || typeof documentContext !== 'object') return undefined;
+  const provenance = (documentContext as { promptProvenance?: unknown }).promptProvenance;
+  return provenance === undefined ? {} : { promptProvenance: provenance };
 }
 
 export interface ParkFacts {

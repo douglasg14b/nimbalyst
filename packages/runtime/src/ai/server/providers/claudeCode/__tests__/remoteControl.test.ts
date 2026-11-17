@@ -13,8 +13,10 @@ import {
   extractUserPromptText,
   isBridgeUp,
   mapBridgeState,
+  remoteControlSpawnKey,
   replayingIterator,
   shouldParkForRemoteControl,
+  warmSpawnDocumentContext,
   type ParkFacts,
 } from '../remoteControl';
 
@@ -142,5 +144,26 @@ describe('asRemoteControlQuery', () => {
     expect(asRemoteControlQuery(null)).toBeNull();
     const query = { enableRemoteControl: async () => ({}) };
     expect(asRemoteControlQuery(query)).toBe(query);
+  });
+});
+
+describe('remoteControlSpawnKey', () => {
+  const base = { modelVariant: 'sonnet', cwd: '/repo' };
+
+  // These shape the system prompt, which is fixed when the process spawns.
+  it('changes with the worktree path and voice mode, so a parked process is replaced', () => {
+    expect(remoteControlSpawnKey({ ...base, worktreePath: '/repo/.wt/a' })).not.toBe(remoteControlSpawnKey(base));
+    expect(remoteControlSpawnKey({ ...base, voiceMode: true })).not.toBe(remoteControlSpawnKey(base));
+    expect(remoteControlSpawnKey({ ...base, voiceMode: false })).toBe(remoteControlSpawnKey(base));
+  });
+});
+
+describe('warmSpawnDocumentContext', () => {
+  it('keeps only the prompt provenance, never the open file', () => {
+    const provenance = { actor: 'human', origin: 'composer' };
+    expect(warmSpawnDocumentContext({ content: 'x'.repeat(10_000), filePath: '/a.md', promptProvenance: provenance }))
+      .toEqual({ promptProvenance: provenance });
+    expect(warmSpawnDocumentContext({ content: 'x' })).toEqual({});
+    expect(warmSpawnDocumentContext(undefined)).toBeUndefined();
   });
 });

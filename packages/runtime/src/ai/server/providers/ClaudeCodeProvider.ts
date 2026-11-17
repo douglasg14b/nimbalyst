@@ -213,8 +213,12 @@ interface ParkedRemoteControlQuery {
   spawnKey: string;
   modelVariant: string | null;
   sessionId: string | undefined;
-  /** Set once a prompt sent through Remote Control started a turn on this process. */
-  remoteTurn: { text: string } | null;
+  /**
+   * Set once a prompt sent through Remote Control started a turn on this
+   * process. `text` is what the transcript shows (the placeholder when the
+   * prompt was unreadable); `promptText` is the prompt as read, for echo matching.
+   */
+  remoteTurn: { text: string; promptText: string | null } | null;
   stopPump: (() => void) | null;
   pumpDone: Promise<void>;
 }
@@ -830,9 +834,11 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       yield { type: 'complete', isComplete: true };
       return;
     }
-    let remoteEchoPending = adoptedForRemoteTurn;
-    // Null when the prompt text could not be read: then the first prompt chunk is the echo.
+    // The echo is the user chunk that started the remote turn. A turn that
+    // started on anything else (an assistant chunk, a placeholder prompt) has
+    // no echo still to come, so a later user chunk is real and is kept.
     const remoteEchoText = adoptedForRemoteTurn ? parkedAdoption!.remoteText : null;
+    let remoteEchoPending = adoptedForRemoteTurn && remoteEchoText !== null;
 
     if (adopted) {
       // The live process was spawned with this controller and these hooks.
@@ -870,6 +876,8 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     // iterator, a `next()` it left in flight, and how the turn ended.
     let turnIterator: AsyncIterator<any> | null = null;
     let turnPendingNext: Promise<IteratorResult<any>> | null = null;
+    // Init-like chunks the phone's next turn sent while this one waited for its suggestion.
+    const turnRemotePreamble: unknown[] = [];
     let turnErrored = false;
     let turnRetried = false;
 
@@ -1202,7 +1210,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
             }
             if (
               remoteEchoPending && isUserPromptChunk(chunk)
-              && (remoteEchoText === null || extractUserPromptText(chunk) === remoteEchoText)
+              && extractUserPromptText(chunk) === remoteEchoText
             ) {
               // The CLI's copy of the prompt sent from the phone. The prologue
               // already logged that prompt as this turn's input row; persisting
@@ -1210,10 +1218,17 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
               remoteEchoPending = false;
               continue;
             }
-            if (
-              state.completeEmitted && this.awaitingPromptSuggestion && !this.drainingBackgroundTasks
-              && classifyParkedChunk(chunk).kind === 'turn-start'
-            ) {
+            const postCompleteKind = state.completeEmitted && this.awaitingPromptSuggestion && !this.drainingBackgroundTasks
+              ? classifyParkedChunk(chunk).kind
+              : null;
+            if (postCompleteKind === 'preamble') {
+              // May open the phone's next turn; it belongs to that turn, not this
+              // finished one. The park replays it if that turn starts.
+              turnRemotePreamble.push(chunk);
+              if (turnRemotePreamble.length > REMOTE_PREAMBLE_MAX_CHUNKS) turnRemotePreamble.shift();
+              continue;
+            }
+            if (postCompleteKind === 'turn-start') {
               // A prompt from the phone started the next turn while this one was
               // only waiting for its suggestion frame. Hand the chunk to the
               // park, where the idle pump starts it as a remote turn; without
@@ -1915,6 +1930,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
           turnQuery,
           turnIterator,
           turnPendingNext,
+          turnRemotePreamble,
           turnSpawnKey,
           sessionId,
           completeEmitted: state.completeEmitted,
@@ -2806,9 +2822,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       // CLI answers the remote prompt first, inside this turn.
       console.warn(`[CLAUDE-CODE] REMOTE_CONTROL: a local prompt adopted a query with a remote turn in progress (session ${sessionId ?? 'unknown'})`);
     }
-    const remoteText = parked.remoteTurn && parked.remoteTurn.text !== REMOTE_CONTROL_PLACEHOLDER_PROMPT
-      ? parked.remoteTurn.text
-      : null;
+    const remoteText = parked.remoteTurn?.promptText ?? null;
     return {
       adopted: {
         ...parked.adopted,
@@ -2825,6 +2839,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     turnQuery: Query | null;
     turnIterator: AsyncIterator<any> | null;
     turnPendingNext: Promise<IteratorResult<any>> | null;
+    turnRemotePreamble: unknown[];
     turnSpawnKey: string;
     sessionId: string | undefined;
     completeEmitted: boolean;
@@ -2866,7 +2881,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
         toolHooksService: this.toolHooksService,
       },
       buffered: [],
-      preamble: [],
+      preamble: [...args.turnRemotePreamble],
       spawnKey: args.turnSpawnKey,
       modelVariant: this.liveQueryModelVariant,
       sessionId: args.sessionId,
@@ -2976,7 +2991,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
           // UNVERIFIED: the shape of a remote prompt on this stream has not been
           // observed yet. This line is how the first real one gets recorded.
           console.log(`[CLAUDE-CODE] REMOTE_CONTROL: remote turn started (first chunk ${describeChunkShape(chunk)}; prompt text ${classified.text ? 'found' : 'not found, using a placeholder'})`);
-          parked.remoteTurn = { text: classified.text ?? REMOTE_CONTROL_PLACEHOLDER_PROMPT };
+          parked.remoteTurn = { text: classified.text ?? REMOTE_CONTROL_PLACEHOLDER_PROMPT, promptText: classified.text };
           this.emit('remoteControl:turnStarted', {
             sessionId: parked.sessionId ?? this.rcSessionId,
             text: parked.remoteTurn.text,

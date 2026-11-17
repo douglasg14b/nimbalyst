@@ -420,6 +420,19 @@ describe('ClaudeCodeProvider with Remote Control on', () => {
     live.send({ type: 'assistant', session_id: 'sdk-session-1', message: { id: 'msg_r', content: [{ type: 'text', text: 'hm' }] } });
     await waitFor(() => started.length === 1);
     expect(started[0].text).toBe('Prompt from Remote Control');
+
+    // No echo is pending for a turn that started on an answer: a later user
+    // prompt on the stream is real and is kept, not dropped as the echo.
+    const persistedBefore = internals(provider).logAgentMessageNonBlocking.mock.calls.length;
+    const turn = runTurn(provider, started[0].text, undefined, { mode: 'agent', promptOrigin: 'remote_control' });
+    live.send(
+      { type: 'user', message: { role: 'user', content: 'a second phone message' }, parent_tool_use_id: null },
+      { type: 'result', subtype: 'success', is_error: false, num_turns: 1 },
+    );
+    const chunks = await turn;
+    expect(chunks.filter((c) => c.type === 'text').map((c) => c.content)).toEqual(['hm']);
+    const persisted = internals(provider).logAgentMessageNonBlocking.mock.calls.slice(persistedBefore).map((call) => String(call[3]));
+    expect(persisted.some((content) => content.includes('a second phone message'))).toBe(true);
   });
 
   it('ignores noise and unrecognised chunks while parked', async () => {
@@ -578,8 +591,10 @@ describe('ClaudeCodeProvider with Remote Control on, across the prompt suggestio
     provider.on('remoteControl:turnStarted', (payload) => started.push(payload));
     const phone = { type: 'user', message: { role: 'user', content: 'from phone mid-wait' }, parent_tool_use_id: null };
 
+    // The phone's turn opens with its own init, which belongs to that turn.
+    const remoteInit = { ...INIT_CHUNK, uuid: 'remote-init' };
     const chunks = await firstTurnWithRemoteControl(provider, live, 'laptop', HUMAN, (chunk) => {
-      if (chunk.type === 'complete') live.send(phone);
+      if (chunk.type === 'complete') live.send(remoteInit, phone);
     });
 
     expect(chunks.map((chunk) => chunk.type)).toEqual(['text', 'complete']);
@@ -588,5 +603,16 @@ describe('ClaudeCodeProvider with Remote Control on, across the prompt suggestio
     expect(provider.hasPendingRemoteControlTurn()).toBe(true);
     const persisted = internals(provider).logAgentMessageNonBlocking.mock.calls.map((call) => String(call[3]));
     expect(persisted.some((content) => content.includes('from phone mid-wait'))).toBe(false);
+    expect(persisted.some((content) => content.includes('remote-init'))).toBe(false);
+
+    // The remote turn then runs on the parked query, init replayed ahead of it.
+    const remoteTurn = runTurn(provider, 'from phone mid-wait', undefined, { mode: 'agent', promptOrigin: 'remote_control' });
+    live.send(
+      { type: 'assistant', session_id: 'sdk-session-1', message: { id: 'msg_r', content: [{ type: 'text', text: 'phone answer' }] } },
+      { type: 'result', subtype: 'success', is_error: false, num_turns: 1 },
+    );
+    const remoteChunks = await remoteTurn;
+    expect(remoteChunks.filter((c) => c.type === 'text').map((c) => c.content)).toEqual(['phone answer']);
+    expect(live.prompts).toHaveLength(1);
   });
 });

@@ -243,7 +243,16 @@ test('npx runs the published CLI even in a project that has its own @nimbalyst/c
     writeFileSync(path.join(pkg, 'package.json'), JSON.stringify({ name: '@nimbalyst/cli', version, bin: { nim: 'bin/nim.js' } }));
     writeFileSync(path.join(pkg, 'bin', 'nim.js'), '#!/usr/bin/env node\nconsole.log("LOCAL COPY");\n', { mode: 0o755 });
     mkdirSync(path.join(project, 'node_modules', '.bin'));
-    symlinkSync('../@nimbalyst/cli/bin/nim.js', path.join(project, 'node_modules', '.bin', 'nim'));
+    const binLink = path.join(project, 'node_modules', '.bin', 'nim');
+    if (process.platform === 'win32') {
+      // npm writes a .cmd shim on Windows; a file symlink needs Developer Mode or admin there.
+      writeFileSync(`${binLink}.cmd`, '@node "%~dp0\\..\\@nimbalyst\\cli\\bin\\nim.js" %*\r\n');
+      // The planted copy must really be runnable, or "npx did not run it" below proves nothing.
+      const planted = spawnSync(`"${binLink}.cmd"`, { cwd: project, encoding: 'utf8', shell: true });
+      assert.match(planted.stdout, /LOCAL COPY/, planted.stderr);
+    } else {
+      symlinkSync('../@nimbalyst/cli/bin/nim.js', binLink);
+    }
     writeFileSync(path.join(project, 'package.json'), JSON.stringify({ name: 'host', private: true }));
     const configs = buildPluginConfigs();
     const args = JSON.parse(configs.get('.mcp.json')).mcpServers['nimbalyst-session'].args

@@ -13,6 +13,10 @@ interface Query extends AsyncGenerator<SDKMessage, void> {
   streamInput(stream: AsyncIterable<any>): Promise<void>;
   mcpServerStatus(): Promise<McpServerStatusInfo[]>;
   reconnectMcpServer(serverName: string): Promise<void>;
+  /** Resolves once the CLI has answered `initialize`; used by the Remote Control warm query. */
+  initializationResult?(): Promise<unknown>;
+  // `enableRemoteControl` exists on the query too but is undeclared by the
+  // SDK; it is cast in exactly one place, claudeCode/remoteControl.ts (#460).
   /** Close the query and terminate the underlying CLI subprocess. */
   close(): void;
 }
@@ -104,7 +108,38 @@ import {
   type ToolPermissionOptions,
 } from './claudeCode/toolAuthorization';
 import { ClaudeCodeDeps, type HistoryManagerPort } from './claudeCode/dependencyInjection';
-import { resolvePermissionMode, type PromptStreamController } from './claudeCode/sdkOptionsBuilder';
+import {
+  buildSdkOptions,
+  createPersistentPromptStream,
+  resolvePermissionMode,
+  type BuildSdkOptionsParams,
+  type PromptStreamController,
+} from './claudeCode/sdkOptionsBuilder';
+import {
+  REMOTE_CONTROL_PLACEHOLDER_PROMPT,
+  REMOTE_CONTROL_PROMPT_ORIGIN,
+  REMOTE_CONTROL_RESTORE_DELAY_MS,
+  REMOTE_PROMPT_TEXT_MAX_CHUNKS,
+  REMOTE_PROMPT_TEXT_WAIT_MS,
+  asRemoteControlQuery,
+  bridgeStateOf,
+  chunkShapeKey,
+  classifyParkedChunk,
+  describeChunkShape,
+  extractUserPromptText,
+  isBridgeUp,
+  isRemoteSideDisable,
+  isUserPromptChunk,
+  mapBridgeState,
+  remoteControlCarryOver,
+  remoteControlSpawnKey,
+  replayingIterator,
+  shouldParkForRemoteControl,
+  type RemoteControlCarry,
+  type RemoteControlInfo,
+  type RemoteControlState,
+  type RemoteControlStatus,
+} from './claudeCode/remoteControl';
 import { resolveEffectiveSessionMode } from './claudeCode/resolveEffectiveSessionMode';
 import { resolveClaudeConfigDir } from './claudeCode/claudeConfigDir';
 import {
@@ -153,7 +188,7 @@ import {
 import { normalizeStructuredContextUsage } from '../utils/contextUsage';
 import { createTurnState } from './claudeCode/turnState';
 import { blockingUsageLimit, rateLimitMarker, usageLimitSystemMessage } from './claudeCode/usageLimit';
-import { buildTurnQuery, prepareTurnAttachments, resolveTurnPaths } from './claudeCode/turnPrologue';
+import { applyMetaAgentToolRestrictions, buildTurnQuery, prepareTurnAttachments, resolveTurnPaths } from './claudeCode/turnPrologue';
 import { buildTurnCompleteUsage, finishTurn, handleTurnError, type TurnEpilogueHost } from './claudeCode/turnEpilogue';
 import { fromDbBoolean } from '../../../core/dbBoolean';
 import { agentToolActivity } from '../agentToolActivity';
@@ -168,6 +203,42 @@ import { exitPlanModeDenialReason, type ExitPlanModeResponse } from '../../exitP
  */
 // CLAUDE_CODE_VARIANT_VERSIONS and CLAUDE_CODE_MODEL_LABELS now live in
 // `modelConstants.ts` so the renderer can share them — see comment there.
+
+/** A live query kept open between turns while Remote Control is on (GH #1480). */
+interface ParkedRemoteControlQuery {
+  adopted: AdoptedQuery<Query, AgentToolHooks | null>;
+  /** Chunks the idle pump read after a remote turn started; replayed to the adopting turn. */
+  buffered: unknown[];
+  spawnKey: string;
+  modelVariant: string | null;
+  sessionId: string | undefined;
+  /** Set once a prompt sent through Remote Control started a turn on this process. */
+  remoteTurn: { text: string } | null;
+  stopPump: (() => void) | null;
+  pumpDone: Promise<void>;
+}
+
+interface LastSpawnContext {
+  sdkOptionsParams: BuildSdkOptionsParams;
+  sessionId: string;
+  workspacePath: string;
+  permissionsPath: string | undefined;
+  isMetaAgent: boolean;
+  spawnKey: string;
+}
+
+export type { RemoteControlInfo, RemoteControlStatus } from './claudeCode/remoteControl';
+
+/** Bound on each Remote Control control request, so a wedged CLI cannot hold the next turn. */
+const REMOTE_CONTROL_REQUEST_TIMEOUT_MS = 30_000;
+
+function withRemoteControlTimeout<T>(promise: Promise<T>, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), REMOTE_CONTROL_REQUEST_TIMEOUT_MS);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
 
 export interface ScheduleWakeupRequest {
   sessionId: string;
@@ -285,6 +356,40 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
   private drainHandoff: DrainHandoff<Query, AgentToolHooks | null> | null = null;
   // Model the live query was spawned with; a follow-up on another model needs its own process.
   private liveQueryModelVariant: string | null = null;
+
+  // ---- Remote Control (GH #1480) -------------------------------------------
+  // Off for every session until the user turns it on; every branch that reads
+  // these is gated on `rcDesired` (or on a parked query, which only exists
+  // while it is true). Decisions live in claudeCode/remoteControl.ts.
+  private rcDesired = false;
+  private rcName: string | undefined;
+  // Last bridge the SDK reported. Kept across a reattach: it returns the same URL.
+  private rcInfo: RemoteControlInfo | null = null;
+  private rcState: RemoteControlState = 'off';
+  private rcError: string | null = null;
+  // The query the bridge is on. Null when no live process holds it.
+  private rcBridgeQuery: Query | null = null;
+  // An enableRemoteControl call in flight, deduplicated per query.
+  private rcAttaching: { query: Query; promise: Promise<void> } | null = null;
+  // Queries that ended or were closed while Remote Control was involved, so a
+  // late-resolving attach never marks a dead process as holding the bridge.
+  private readonly rcEndedQueries = new WeakSet<object>();
+  // Nimbalyst session id for Remote Control events. `currentSessionId` is only
+  // set for sessions with MCP servers and is cleared by abort().
+  private rcSessionId: string | undefined;
+  // The live query kept open between turns so the bridge survives the idle period.
+  private parkedQuery: ParkedRemoteControlQuery | null = null;
+  // A warm query being spawned to carry the bridge while idle.
+  private rcWarmSpawn: Promise<void> | null = null;
+  private rcWarmSpawnCancelled = false;
+  private rcRestoreTimer: ReturnType<typeof setTimeout> | null = null;
+  // Automatic idle restores since the last cleanly parked turn; bounds a crash loop.
+  private rcRestoreAttempts = 0;
+  private readonly rcLoggedShapes = new Set<string>();
+  private rcDestroyed = false;
+  // What the last turn spawned its process with, minus its prompt, so Remote
+  // Control can start a warm query while the session is idle.
+  private lastSpawnContext: LastSpawnContext | null = null;
 
   // Teammate management: spawning, messaging, lifecycle, config I/O
   private teammateManager: TeammateManager;
@@ -684,11 +789,47 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     // throws to the caller rather than becoming an error chunk.
     const prepared = await prepareTurnAttachments({ sessionId, workspacePath, attachments });
 
+    // Remote Control (GH #1480) bookkeeping. Plain values: nothing below reads
+    // them unless Remote Control is on for this session.
+    if (sessionId) this.rcSessionId = sessionId;
+    const turnSpawnKey = remoteControlSpawnKey({
+      modelVariant: this.resolveModelVariant(),
+      effortLevel: this.config?.effortLevel,
+      thinkingMode: this.config?.thinkingMode,
+      cwd: workspacePath,
+      permissionsPath: paths.permissionsPath,
+      mcpConfigWorkspacePath: paths.mcpConfigWorkspacePath,
+    });
+    // A model switch replaces the provider; its successor reattaches (see remoteControl.ts).
+    if (!this.rcDesired && sessionId && remoteControlCarryOver.peek(sessionId)) {
+      this.resumeRemoteControlCarry(remoteControlCarryOver.take(sessionId)!);
+    }
+    const remoteTurnRequested = (documentContext as any)?.promptOrigin === REMOTE_CONTROL_PROMPT_ORIGIN;
+
     // A follow-up while a background task keeps the previous turn draining
     // adopts that live query; aborting it would kill the task with the process.
-    const adopted = this.canAcceptFollowUpDuringDrain() && this.liveQueryModelVariant === this.resolveModelVariant()
+    const drainAdopted = this.canAcceptFollowUpDuringDrain() && this.liveQueryModelVariant === this.resolveModelVariant()
       ? await this.takeOverDrainingQuery()
       : null;
+    // With Remote Control on, the previous turn may have parked its live query
+    // instead of ending it; this turn takes it over the same way.
+    const parkedAdoption = !drainAdopted && (this.parkedQuery || this.rcWarmSpawn)
+      ? await this.takeParkedQuery(turnSpawnKey, remoteTurnRequested, sessionId)
+      : null;
+    const adopted = drainAdopted ?? parkedAdoption?.adopted ?? null;
+    // This turn runs a prompt the user sent from their phone or browser: the
+    // CLI already has it, so nothing is pushed and the CLI's echo of it is dropped.
+    const adoptedForRemoteTurn = parkedAdoption?.remoteTurn === true;
+    if (remoteTurnRequested && !adoptedForRemoteTurn) {
+      // The remote prompt was already consumed by another turn, or the bridge
+      // process died before this wake ran. Running it again would send it twice.
+      console.warn('[CLAUDE-CODE] REMOTE_CONTROL: remote-turn wake found no pending remote turn; skipping');
+      yield { type: 'complete', isComplete: true };
+      return;
+    }
+    let remoteEchoPending = adoptedForRemoteTurn;
+    // Null when the prompt text could not be read: then the first prompt chunk is the echo.
+    const remoteEchoText = adoptedForRemoteTurn ? parkedAdoption!.remoteText : null;
 
     if (adopted) {
       // The live process was spawned with this controller and these hooks.
@@ -722,6 +863,12 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     // outlive the turn nor end the newer turn's prompt stream.
     let turnPromptController: PromptStreamController | null = null;
     let turnPromptEndTimer: ReturnType<typeof setTimeout> | null = null;
+    // Read only by the Remote Control park in the finally block: the turn's
+    // iterator, a `next()` it left in flight, and how the turn ended.
+    let turnIterator: AsyncIterator<any> | null = null;
+    let turnPendingNext: Promise<IteratorResult<any>> | null = null;
+    let turnErrored = false;
+    let turnRetried = false;
 
     // Clear edited files tracker for new turn
     this.toolHooksService.clearEditedFiles();
@@ -744,6 +891,8 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
         promptController: builtPromptController,
         transcriptAdapter,
         queryStartTime,
+        isMetaAgent,
+        sdkOptionsParams,
       } = await buildTurnQuery(
         {
           getAgentRole: (sid) => this.getAgentRole(sid),
@@ -786,13 +935,27 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
 
       const queryCallStart = Date.now();
 
-      const leadQuery: AsyncIterable<any> = adopted
+      const leadQuery: AsyncIterable<any> = adoptedForRemoteTurn
+        ? await this.runRemoteTurnOnAdoptedQuery(adopted!, builtPromptController)
+        : adopted
         ? await this.deliverToAdoptedQuery(adopted, promptInput, builtPromptController)
         : query({
           prompt: promptInput as any,
           options
         });
       if (!adopted) this.liveQueryModelVariant = this.resolveModelVariant();
+      if (sessionId && workspacePath) {
+        // What a Remote Control warm query is rebuilt from while the session is
+        // idle. A shallow copy without this turn's prompt and attachments.
+        this.lastSpawnContext = {
+          sdkOptionsParams: { ...sdkOptionsParams, message: '', imageContentBlocks: [], documentContentBlocks: [] },
+          sessionId,
+          workspacePath,
+          permissionsPath: paths.permissionsPath,
+          isMetaAgent,
+          spawnKey: turnSpawnKey,
+        };
+      }
 
       this.leadQuery = leadQuery as unknown as Query;
       turnQuery = this.leadQuery;
@@ -908,6 +1071,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
         const iterator = adopted
           ? adopted.iterator as AsyncIterator<any>
           : (queryIterator as AsyncIterable<any>)[Symbol.asyncIterator]();
+        turnIterator = iterator;
         let carriedNext = adopted?.pendingNext ?? null;
         let interruptPromise = new Promise<'interrupted'>(resolve => {
           this.interruptResolve = () => resolve('interrupted');
@@ -964,6 +1128,9 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
           if (raceResult.kind === 'stalled' && awaitingSuggestion) {
             // No suggestion came (the CLI suppressed it): the wait is over, not a wedged stream.
             void nextPromise.catch(() => {});
+            // Still in flight. If Remote Control parks this query, the pump must
+            // read this promise rather than call next() again and lose a chunk.
+            turnPendingNext = nextPromise;
             console.log(`[CLAUDE-CODE] PROMPT_SUGGESTION: none within ${PROMPT_SUGGESTION_WAIT_MS}ms of result; ending turn`);
             this.drainExitCause = 'resolved';
             break;
@@ -1014,6 +1181,49 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
               break;
             }
             continue;
+          }
+
+          // Remote Control (GH #1480). Only while it is on: with it off, bridge
+          // chunks never occur and every chunk takes the path below unchanged.
+          if (this.rcDesired && chunk && typeof chunk === 'object') {
+            const bridgeState = bridgeStateOf(chunk);
+            if (bridgeState !== null) {
+              // Bridge telemetry, not transcript: kept out of persistence and
+              // out of the grace timer.
+              this.applyBridgeState(bridgeState, turnQuery);
+              continue;
+            }
+            if (isRemoteSideDisable(chunk)) {
+              this.handleRemoteSideDisable();
+              continue;
+            }
+            if (
+              remoteEchoPending && isUserPromptChunk(chunk)
+              && (remoteEchoText === null || extractUserPromptText(chunk) === remoteEchoText)
+            ) {
+              // The CLI's copy of the prompt sent from the phone. The prologue
+              // already logged that prompt as this turn's input row; persisting
+              // the echo too would show it twice.
+              remoteEchoPending = false;
+              continue;
+            }
+            if (
+              state.completeEmitted && this.awaitingPromptSuggestion && !this.drainingBackgroundTasks
+              && classifyParkedChunk(chunk).kind === 'turn-start'
+            ) {
+              // A prompt from the phone started the next turn while this one was
+              // only waiting for its suggestion frame. Hand the chunk to the
+              // park, where the idle pump starts it as a remote turn; without
+              // this it would be swallowed by the post-complete filter below.
+              turnPendingNext = Promise.resolve({ value: chunk, done: false });
+              this.awaitingPromptSuggestion = false;
+              this.promptSuggestionDeadline = null;
+              this.drainExitCause = 'resolved';
+              break;
+            }
+            if (isUserPromptChunk(chunk)) {
+              this.logRemoteControlShapeOnce('user prompt chunk during a turn', chunk);
+            }
           }
 
           // Grace-period stdin-close logic. The SDK's `isSingleUserTurn` is
@@ -1646,6 +1856,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       yield* finishTurn(this.epilogueHost(), state, { sessionId, transcriptAdapter });
 
     } catch (error: any) {
+      turnErrored = true;
       const outcome = yield* handleTurnError(
         {
           ...this.epilogueHost(),
@@ -1662,6 +1873,8 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       if (outcome.retry) {
         // sendMessage consumes this flag at entry, so restore it for the retry.
         this.markMessagesAsHidden = state.hideMessages;
+        // The retry's own finally runs first and owns Remote Control's state.
+        turnRetried = true;
         yield* this.sendMessage(
           state.originalMessage,
           documentContext,
@@ -1688,16 +1901,29 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
         } catch (error) {
           console.warn('[CLAUDE-CODE] Closing superseded query failed:', error);
         }
+        if (this.rcDesired) this.noteRemoteControlQueryEnded(turnQuery, 'superseded');
       } else {
         // A handoff the follow-up gave up on is a supersede: the follow-up
         // starts its own query and aborts this one.
         if (this.drainExitCause === 'handoff') this.drainExitCause = 'aborted';
-        this.endTurn(sessionId, hideMessages);
+        // Remote Control on: a clean turn keeps its process (and the bridge on
+        // it) alive for the idle period instead of ending its input stream.
+        const parked = this.rcDesired && !turnRetried && this.parkForRemoteControl({
+          turnQuery,
+          turnIterator,
+          turnPendingNext,
+          turnSpawnKey,
+          sessionId,
+          completeEmitted: state.completeEmitted,
+          errored: turnErrored,
+        });
+        this.endTurn(sessionId, hideMessages, parked);
+        if (this.rcDesired && !parked && !turnRetried) this.afterUnparkedRemoteControlTurn(turnQuery);
       }
     }
   }
 
-  private endTurn(sessionId: string | undefined, hideMessages: boolean): void {
+  private endTurn(sessionId: string | undefined, hideMessages: boolean, keepPromptStreamForPark = false): void {
     // Don't stop MCP health checks or clear mcpQuery between turns -
     // the SDK subprocess stays alive for session resume, so MCP operations
     // (health checks, reconnect) should keep working between turns.
@@ -1724,7 +1950,8 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       this.promptEndTimer = null;
     }
     if (this.promptController) {
-      this.promptController.end('sendMessage-finally');
+      // Parked for Remote Control: the park owns the still-open stream.
+      if (!keepPromptStreamForPark) this.promptController.end('sendMessage-finally');
       this.promptController = null;
     }
 
@@ -1803,6 +2030,16 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     this.stopMcpHealthChecks();
     this.mcpQuery = null;
     this.currentSessionId = undefined;
+
+    // A query parked for Remote Control has no promptController or
+    // abortController on the provider, so nothing above stops it. Close it
+    // here; if Remote Control is still wanted the bridge is restored on an
+    // idle warm query, or on the next turn.
+    if (this.parkedQuery || this.rcWarmSpawn) {
+      this.cancelRemoteControlWarmSpawn();
+      this.discardParkedQuery('abort');
+      if (this.rcDesired) this.scheduleRemoteControlRestore();
+    }
   }
 
   // Per-session "transcript processing already scheduled" flag. The streaming
@@ -2187,6 +2424,20 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
   destroy(): void {
     console.log('[CLAUDE-CODE] Destroying provider');
 
+    // Remote Control state is in memory only, so it ends with the provider.
+    // Turn it off first (so abort() below schedules no restore), close any
+    // parked process, and tell the UI while listeners still exist.
+    this.rcDestroyed = true;
+    if (this.rcDesired || this.parkedQuery || this.rcWarmSpawn || this.rcState !== 'off') {
+      this.rcDesired = false;
+      this.clearRemoteControlRestoreTimer();
+      this.cancelRemoteControlWarmSpawn();
+      this.discardParkedQuery('destroy');
+      this.rcBridgeQuery = null;
+      this.rcInfo = null;
+      this.setRemoteControlState('off', null);
+    }
+
     // Clean up permission service
     if (this.permissionService) {
       this.permissionService.clearSessionCache();
@@ -2366,6 +2617,626 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     return adopted.query as unknown as AsyncIterable<any>;
   }
 
+  // ---- Remote Control (GH #1480) -------------------------------------------
+  //
+  // Lifecycle, in one place:
+  //  - enable: put the bridge on the live query (mid-turn), on the parked one,
+  //    or (idle) on a warm query spawned with `resume` and an empty input stream.
+  //  - turn end: a clean turn parks its query instead of ending its input
+  //    stream (parkForRemoteControl); an idle pump reads it.
+  //  - next turn: adopts the parked query (takeParkedQuery). A local prompt is
+  //    pushed onto its stream; a prompt sent from the phone is already in the
+  //    CLI, so the remote turn pushes nothing.
+  //  - any path that ends the process holding the bridge (abort, crash, model
+  //    or option change, drain close, supersede, pump sees the CLI exit) marks
+  //    the bridge down; the next process reattaches with `reattachSessionId`
+  //    at system/init, and an idle session gets one warm restore.
+  //  - disable / destroy: stop the bridge and close any parked process.
+
+  /** Remote Control status for the UI. A bridge that is not up is never reported as up. */
+  public getRemoteControlStatus(): RemoteControlStatus {
+    return {
+      desired: this.rcDesired,
+      state: this.rcState,
+      sessionUrl: this.rcDesired ? this.rcInfo?.session_url ?? null : null,
+      name: this.rcName ?? null,
+      error: this.rcError,
+    };
+  }
+
+  /** A prompt sent through Remote Control started a turn on the parked query and waits for its wake. */
+  public hasPendingRemoteControlTurn(): boolean {
+    return !!this.parkedQuery?.remoteTurn;
+  }
+
+  /**
+   * Turn Remote Control on, or rename it when it is already on. Resolves once
+   * the bridge is up (or, mid-turn setup, once it is requested); rejects with a
+   * user-readable reason when it could not start.
+   */
+  public async enableRemoteControl(name?: string): Promise<RemoteControlStatus> {
+    if (this.rcDestroyed) throw new Error('This session has been closed.');
+    const nextName = name === undefined ? this.rcName : name.trim() || undefined;
+    const nameChanged = nextName !== this.rcName;
+    const wasDesired = this.rcDesired;
+    this.rcDesired = true;
+    this.rcName = nextName;
+    this.rcRestoreAttempts = 0;
+    if (this.rcSessionId) remoteControlCarryOver.clear(this.rcSessionId);
+    console.log(`[CLAUDE-CODE] REMOTE_CONTROL: enable requested${nextName ? ' with a name' : ''}`);
+
+    const live = this.leadQuery ?? this.parkedQuery?.adopted.query ?? null;
+    try {
+      if (live) {
+        if (this.rcBridgeQuery !== live || nameChanged || !isBridgeUp(this.rcState)) {
+          await this.attachRemoteControlBridge(live, { force: nameChanged });
+        }
+        if (this.rcBridgeQuery !== live) throw new Error(this.rcError ?? 'Remote Control did not start.');
+      } else if (this.abortController) {
+        // A turn is being set up; its system/init puts the bridge on its process.
+        this.setRemoteControlState('connecting', null, true);
+      } else {
+        await this.spawnRemoteControlWarmQuery();
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      // A first enable that failed leaves Remote Control off; a failed rename keeps it on.
+      if (!wasDesired) this.rcDesired = false;
+      this.setRemoteControlState('error', message, true);
+      throw error instanceof Error ? error : new Error(message);
+    }
+    return this.getRemoteControlStatus();
+  }
+
+  /** Turn Remote Control off: stop the bridge and close a parked process. Safe when already off. */
+  public async disableRemoteControl(): Promise<RemoteControlStatus> {
+    const wasInvolved = this.rcDesired || this.rcState !== 'off' || !!this.parkedQuery || !!this.rcWarmSpawn;
+    this.rcDesired = false;
+    if (this.rcSessionId) remoteControlCarryOver.clear(this.rcSessionId);
+    this.clearRemoteControlRestoreTimer();
+    this.cancelRemoteControlWarmSpawn();
+    const bridgeQuery = this.rcBridgeQuery;
+    this.rcBridgeQuery = null;
+    if (bridgeQuery && !this.rcEndedQueries.has(bridgeQuery)) {
+      try {
+        await asRemoteControlQuery(bridgeQuery)?.enableRemoteControl(false);
+      } catch (error) {
+        console.warn('[CLAUDE-CODE] REMOTE_CONTROL: disabling the bridge failed:', error instanceof Error ? error.message : error);
+      }
+    }
+    // Idle: nothing else needs the parked process. Mid-turn, the turn ends it as usual.
+    this.discardParkedQuery('remote-control-disabled');
+    this.rcInfo = null;
+    if (wasInvolved) {
+      console.log('[CLAUDE-CODE] REMOTE_CONTROL: disabled');
+      this.setRemoteControlState('off', null, true);
+    }
+    return this.getRemoteControlStatus();
+  }
+
+  /**
+   * Called before this provider is replaced (a model change destroys it), so
+   * its successor reattaches to the same bridge session on its first turn.
+   */
+  public handOffRemoteControlForReplacement(): void {
+    if (!this.rcDesired || !this.rcSessionId) return;
+    remoteControlCarryOver.stash(this.rcSessionId, {
+      name: this.rcName,
+      bridgeSessionId: this.rcInfo?.bridge_session_id,
+      sessionUrl: this.rcInfo?.session_url,
+    });
+  }
+
+  private resumeRemoteControlCarry(carry: RemoteControlCarry): void {
+    console.log('[CLAUDE-CODE] REMOTE_CONTROL: resuming after the provider was replaced; reattaching on this turn');
+    this.rcDesired = true;
+    this.rcName = carry.name;
+    this.rcInfo = carry.bridgeSessionId || carry.sessionUrl
+      ? { bridge_session_id: carry.bridgeSessionId, session_url: carry.sessionUrl }
+      : null;
+    this.setRemoteControlState('connecting', null, true);
+  }
+
+  /** A remote turn runs on the parked process, which already has the prompt: push nothing. */
+  private async runRemoteTurnOnAdoptedQuery(
+    adopted: AdoptedQuery<Query, AgentToolHooks | null>,
+    builtPromptController: PromptStreamController,
+  ): Promise<AsyncIterable<any>> {
+    builtPromptController.end('remote-control-turn');
+    if (typeof adopted.query.setPermissionMode === 'function') {
+      try {
+        await adopted.query.setPermissionMode(resolvePermissionMode(this.currentMode));
+      } catch (error) {
+        console.warn('[CLAUDE-CODE] REMOTE_CONTROL: could not apply the remote turn\'s permission mode:', error);
+      }
+    }
+    return adopted.query as unknown as AsyncIterable<any>;
+  }
+
+  /**
+   * Hand the parked query to a starting turn. Null when there is none, when a
+   * remote-turn wake finds no remote turn, or when the turn needs a process
+   * spawned with different options (that one is closed; the bridge is
+   * reattached on the replacement at its system/init).
+   */
+  private async takeParkedQuery(
+    spawnKey: string,
+    wantRemoteTurn: boolean,
+    sessionId: string | undefined,
+  ): Promise<{ adopted: AdoptedQuery<Query, AgentToolHooks | null>; remoteTurn: boolean; remoteText: string | null } | null> {
+    if (this.rcWarmSpawn) await this.rcWarmSpawn.catch(() => {});
+    const parked = this.parkedQuery;
+    if (!parked) return null;
+    if (wantRemoteTurn && !parked.remoteTurn) return null;
+    this.parkedQuery = null;
+    parked.stopPump?.();
+    await parked.pumpDone;
+    if (parked.adopted.promptController.isEnded() || this.rcEndedQueries.has(parked.adopted.query)) {
+      this.closeParkedQuery(parked, 'stale');
+      return null;
+    }
+    if (!parked.remoteTurn && parked.spawnKey !== spawnKey) {
+      console.log('[CLAUDE-CODE] REMOTE_CONTROL: this turn needs different spawn options; replacing the parked query');
+      this.closeParkedQuery(parked, 'spawn-options-changed');
+      return null;
+    }
+    if (parked.remoteTurn && !wantRemoteTurn) {
+      // A local prompt reached the provider before the remote-turn wake. The
+      // CLI answers the remote prompt first, inside this turn.
+      console.warn(`[CLAUDE-CODE] REMOTE_CONTROL: a local prompt adopted a query with a remote turn in progress (session ${sessionId ?? 'unknown'})`);
+    }
+    const remoteText = parked.remoteTurn && parked.remoteTurn.text !== REMOTE_CONTROL_PLACEHOLDER_PROMPT
+      ? parked.remoteTurn.text
+      : null;
+    return {
+      adopted: {
+        ...parked.adopted,
+        iterator: replayingIterator(parked.buffered, parked.adopted.pendingNext as Promise<IteratorResult<unknown>> | null, parked.adopted.iterator),
+        pendingNext: null,
+      },
+      remoteTurn: !!parked.remoteTurn && wantRemoteTurn,
+      remoteText,
+    };
+  }
+
+  /** At a clean turn end with Remote Control on: keep the query open and start the idle pump. */
+  private parkForRemoteControl(args: {
+    turnQuery: Query | null;
+    turnIterator: AsyncIterator<any> | null;
+    turnPendingNext: Promise<IteratorResult<any>> | null;
+    turnSpawnKey: string;
+    sessionId: string | undefined;
+    completeEmitted: boolean;
+    errored: boolean;
+  }): boolean {
+    const { turnQuery, turnIterator } = args;
+    const promptController = this.promptController;
+    if (!turnQuery || !turnIterator || !promptController || this.parkedQuery) return false;
+    const eligible = shouldParkForRemoteControl({
+      desired: this.rcDesired,
+      bridgeOnTurnQuery: this.rcBridgeQuery === turnQuery || this.rcAttaching?.query === turnQuery,
+      completeEmitted: args.completeEmitted,
+      errored: args.errored,
+      drainExitCause: this.drainExitCause,
+      wasInterrupted: this.wasInterrupted,
+      transportDied: this.transportDied,
+      aborted: !!this.abortController?.signal.aborted,
+      promptStreamOpen: !promptController.isEnded(),
+      drainingBackgroundTasks: this.drainingBackgroundTasks,
+      settledBackgroundTasksThisTurn: this.settledBackgroundTasksThisTurn,
+      hasRunningTasks: this.hasRunningTasks(),
+      sawStreamClosed: this.sawStreamClosedThisTurn,
+      hasTeammateWork: this.teammateIdleMessagePending
+        || this.teammateManager.hasPendingTeammateMessages()
+        || this.teammateManager.hasActiveTeammates(),
+    });
+    if (!eligible) return false;
+    if (this.promptEndTimer) {
+      clearTimeout(this.promptEndTimer);
+      this.promptEndTimer = null;
+    }
+    const parked: ParkedRemoteControlQuery = {
+      adopted: {
+        query: turnQuery,
+        iterator: turnIterator,
+        pendingNext: args.turnPendingNext,
+        promptController,
+        abortController: this.abortController,
+        toolHooksService: this.toolHooksService,
+      },
+      buffered: [],
+      spawnKey: args.turnSpawnKey,
+      modelVariant: this.liveQueryModelVariant,
+      sessionId: args.sessionId,
+      remoteTurn: null,
+      stopPump: null,
+      pumpDone: Promise.resolve(),
+    };
+    this.parkedQuery = parked;
+    this.rcRestoreAttempts = 0;
+    console.log('[CLAUDE-CODE] REMOTE_CONTROL: turn ended; keeping the live query open for the bridge');
+    this.startParkedPump(parked);
+    return true;
+  }
+
+  /** A turn that did not park: its process is ending, and so is the bridge on it. */
+  private afterUnparkedRemoteControlTurn(turnQuery: Query | null): void {
+    this.noteRemoteControlQueryEnded(turnQuery, 'turn-ended');
+    if (!this.parkedQuery) this.scheduleRemoteControlRestore();
+  }
+
+  /** Every path that ends or closes a query reports it here, so the state never claims a dead bridge. */
+  private noteRemoteControlQueryEnded(query: Query | null | undefined, reason: string): void {
+    if (!query) return;
+    this.rcEndedQueries.add(query);
+    if (this.rcBridgeQuery !== query) return;
+    this.rcBridgeQuery = null;
+    if (this.rcDesired) {
+      console.log(`[CLAUDE-CODE] REMOTE_CONTROL: the process holding the bridge ended (${reason})`);
+      this.setRemoteControlState('disconnected', null);
+    }
+  }
+
+  private startParkedPump(parked: ParkedRemoteControlQuery): void {
+    let stop!: () => void;
+    const stopped = new Promise<void>((resolve) => { stop = resolve; });
+    parked.stopPump = stop;
+    parked.pumpDone = this.runParkedPump(parked, stopped).catch((error) => {
+      console.warn('[CLAUDE-CODE] REMOTE_CONTROL: idle pump failed:', error);
+    });
+  }
+
+  /**
+   * Read the next chunk of a parked query. Only a chunk clears `pendingNext`:
+   * on stop or timeout the in-flight `next()` stays there for whoever reads
+   * next, and on end the settled promise stays so an adopter sees the end too.
+   */
+  private async readParkedChunk(
+    parked: ParkedRemoteControlQuery,
+    stopped: Promise<void>,
+    timeoutMs?: number,
+  ): Promise<{ kind: 'stop' } | { kind: 'timeout' } | { kind: 'end'; error?: unknown } | { kind: 'chunk'; value: unknown }> {
+    const next = (parked.adopted.pendingNext ?? parked.adopted.iterator.next()) as Promise<IteratorResult<unknown>>;
+    parked.adopted.pendingNext = next;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    type Read = { kind: 'stop' } | { kind: 'timeout' } | { kind: 'end'; error?: unknown } | { kind: 'chunk'; value: unknown };
+    const racers: Promise<Read>[] = [
+      next.then(
+        (result): Read => (result.done ? { kind: 'end' } : { kind: 'chunk', value: result.value }),
+        (error): Read => ({ kind: 'end', error }),
+      ),
+      stopped.then((): Read => ({ kind: 'stop' })),
+    ];
+    if (timeoutMs !== undefined) {
+      racers.push(new Promise<Read>((resolve) => { timer = setTimeout(() => resolve({ kind: 'timeout' }), timeoutMs); }));
+    }
+    try {
+      const read = await Promise.race(racers);
+      if (read.kind === 'chunk') parked.adopted.pendingNext = null;
+      return read;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /**
+   * The idle pump. Bridge chunks update the state; noise is dropped; the CLI
+   * exiting means the bridge is down; the first turn-starting chunk is a
+   * prompt sent from the phone, which stops the pump and wakes the session.
+   */
+  private async runParkedPump(parked: ParkedRemoteControlQuery, stopped: Promise<void>): Promise<void> {
+    while (this.parkedQuery === parked) {
+      const read = await this.readParkedChunk(parked, stopped);
+      if (read.kind === 'stop' || read.kind === 'timeout' || this.parkedQuery !== parked) return;
+      if (read.kind === 'end') {
+        console.log(`[CLAUDE-CODE] REMOTE_CONTROL: the parked query ended while idle${read.error ? ' with an error' : ''}`);
+        this.parkedQuery = null;
+        this.closeParkedQuery(parked, 'iterator-ended');
+        // One warm restore (bounded by rcRestoreAttempts, reset only by a
+        // cleanly parked turn), so a CLI that keeps dying cannot respawn in a loop.
+        this.scheduleRemoteControlRestore();
+        return;
+      }
+      const chunk = read.value;
+      const classified = classifyParkedChunk(chunk);
+      switch (classified.kind) {
+        case 'bridge':
+          this.applyBridgeState(classified.state, parked.adopted.query);
+          continue;
+        case 'bridge-off':
+          this.handleRemoteSideDisable();
+          return;
+        case 'noise':
+          continue;
+        case 'unknown':
+          this.logRemoteControlShapeOnce('unrecognised chunk while parked', chunk);
+          continue;
+        case 'turn-start': {
+          parked.buffered.push(chunk);
+          let text = classified.text;
+          if (text === null) {
+            const collected = await this.collectRemotePromptText(parked, stopped);
+            if (collected === 'stopped' || this.parkedQuery !== parked) return;
+            text = collected;
+          }
+          // UNVERIFIED: the shape of a remote prompt on this stream has not been
+          // observed yet. This line is how the first real one gets recorded.
+          console.log(`[CLAUDE-CODE] REMOTE_CONTROL: remote turn started (first chunk ${describeChunkShape(chunk)}; prompt text ${text ? 'found' : 'not found, using a placeholder'})`);
+          parked.remoteTurn = { text: text ?? REMOTE_CONTROL_PLACEHOLDER_PROMPT };
+          this.emit('remoteControl:turnStarted', {
+            sessionId: parked.sessionId ?? this.rcSessionId,
+            text: parked.remoteTurn.text,
+          });
+          return;
+        }
+      }
+    }
+  }
+
+  /** After a turn-start without text, read a little further for the user chunk carrying the prompt. */
+  private async collectRemotePromptText(
+    parked: ParkedRemoteControlQuery,
+    stopped: Promise<void>,
+  ): Promise<string | null | 'stopped'> {
+    const deadline = Date.now() + REMOTE_PROMPT_TEXT_WAIT_MS;
+    for (let index = 0; index < REMOTE_PROMPT_TEXT_MAX_CHUNKS; index++) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return null;
+      const read = await this.readParkedChunk(parked, stopped, remaining);
+      if (read.kind === 'stop') return 'stopped';
+      if (read.kind !== 'chunk') return null;
+      const bridgeState = bridgeStateOf(read.value);
+      if (bridgeState !== null) {
+        this.applyBridgeState(bridgeState, parked.adopted.query);
+        continue;
+      }
+      parked.buffered.push(read.value);
+      if (isUserPromptChunk(read.value)) return extractUserPromptText(read.value);
+    }
+    return null;
+  }
+
+  private discardParkedQuery(reason: string): void {
+    const parked = this.parkedQuery;
+    if (!parked) return;
+    this.parkedQuery = null;
+    this.closeParkedQuery(parked, reason);
+  }
+
+  private closeParkedQuery(parked: ParkedRemoteControlQuery, reason: string): void {
+    parked.stopPump?.();
+    void parked.adopted.pendingNext?.catch(() => {});
+    try {
+      parked.adopted.promptController.end(`remote-control-${reason}`);
+    } catch {
+      // Best effort.
+    }
+    try {
+      parked.adopted.query.close();
+    } catch (error) {
+      console.warn('[CLAUDE-CODE] REMOTE_CONTROL: closing the parked query failed:', error);
+    }
+    console.log(`[CLAUDE-CODE] REMOTE_CONTROL: closed the parked query (${reason})`);
+    this.noteRemoteControlQueryEnded(parked.adopted.query, reason);
+  }
+
+  /** One automatic warm restore for an idle session whose bridge ended with its turn. */
+  private scheduleRemoteControlRestore(): void {
+    if (!this.rcDesired || this.rcDestroyed || this.rcRestoreTimer || this.parkedQuery || this.rcWarmSpawn) return;
+    if (this.rcRestoreAttempts >= 1) return;
+    const timer = setTimeout(() => {
+      if (this.rcRestoreTimer === timer) this.rcRestoreTimer = null;
+      if (
+        !this.rcDesired || this.rcDestroyed || this.leadQuery || this.abortController
+        || this.parkedQuery || this.rcWarmSpawn || this.teammateIdleMessagePending
+      ) return;
+      this.rcRestoreAttempts++;
+      console.log('[CLAUDE-CODE] REMOTE_CONTROL: restoring the bridge on an idle warm query');
+      this.spawnRemoteControlWarmQuery().catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn('[CLAUDE-CODE] REMOTE_CONTROL: idle restore failed:', message);
+        if (this.rcDesired) this.setRemoteControlState('disconnected', `Reconnects on this session's next message. (${message})`);
+      });
+    }, REMOTE_CONTROL_RESTORE_DELAY_MS);
+    (timer as { unref?: () => void }).unref?.();
+    this.rcRestoreTimer = timer;
+  }
+
+  private clearRemoteControlRestoreTimer(): void {
+    if (this.rcRestoreTimer) {
+      clearTimeout(this.rcRestoreTimer);
+      this.rcRestoreTimer = null;
+    }
+  }
+
+  private cancelRemoteControlWarmSpawn(): void {
+    if (this.rcWarmSpawn) this.rcWarmSpawnCancelled = true;
+  }
+
+  /**
+   * Start a CLI process with no prompt (resume + an empty input stream; works
+   * per the probe), put the bridge on it, and park it. Rebuilt from the last
+   * turn's spawn inputs with its own abort controller and hooks.
+   */
+  private spawnRemoteControlWarmQuery(): Promise<void> {
+    if (this.rcWarmSpawn) return this.rcWarmSpawn;
+    const context = this.lastSpawnContext;
+    if (!context) {
+      return Promise.reject(new Error('Remote Control can start once this session has run a turn. Send a message first.'));
+    }
+    if (!this.sessions.getSessionId(context.sessionId)) {
+      return Promise.reject(new Error('Remote Control needs the Claude conversation to exist first. Send a message, then turn it on.'));
+    }
+    this.rcWarmSpawnCancelled = false;
+    const spawn = this.runRemoteControlWarmSpawn(context);
+    this.rcWarmSpawn = spawn;
+    const clear = () => { if (this.rcWarmSpawn === spawn) this.rcWarmSpawn = null; };
+    spawn.then(clear, clear);
+    return spawn;
+  }
+
+  private async runRemoteControlWarmSpawn(context: LastSpawnContext): Promise<void> {
+    const cancelled = () => this.rcWarmSpawnCancelled || !this.rcDesired || this.rcDestroyed;
+    this.setRemoteControlState('connecting', null);
+    const abortController = new AbortController();
+    const toolHooksService = this.createToolHooksService(context.workspacePath, context.sessionId, context.permissionsPath, false);
+    const sdk = await buildSdkOptions(
+      {
+        resolveModelVariant: () => this.resolveModelVariant(),
+        getMcpServersSnapshot: (options) => this.getMcpServersSnapshot(options),
+        createCanUseToolHandler: (sid, wp, pp) => this.createCanUseToolHandler(sid, wp, pp),
+        toolHooksService,
+        teammateManager: this.teammateManager,
+        sessions: this.sessions,
+        config: this.config,
+        abortController,
+      },
+      { ...context.sdkOptionsParams, currentMode: this.currentMode ?? context.sdkOptionsParams.currentMode },
+    );
+    // Built with an empty placeholder prompt that is never sent.
+    sdk.promptController.end('remote-control-warm-query');
+    if (context.isMetaAgent) applyMetaAgentToolRestrictions(sdk.options, BaseAgentProvider.META_AGENT_ALLOWED_TOOLS);
+    sdk.options.stderr = (data: string) => {
+      const trimmed = data.trim();
+      if (trimmed) console.warn(`[CLAUDE-CODE-STDERR] ${trimmed.substring(0, 300)}`);
+    };
+    if (cancelled()) throw new Error('Remote Control was turned off.');
+
+    const stream = createPersistentPromptStream(null);
+    const warm = query({ prompt: stream.iterable as any, options: sdk.options }) as unknown as Query;
+    const parked: ParkedRemoteControlQuery = {
+      adopted: {
+        query: warm,
+        iterator: (warm as unknown as AsyncIterable<unknown>)[Symbol.asyncIterator](),
+        pendingNext: null,
+        promptController: stream.controller,
+        abortController,
+        toolHooksService,
+      },
+      buffered: [],
+      spawnKey: context.spawnKey,
+      modelVariant: this.resolveModelVariant(),
+      sessionId: context.sessionId,
+      remoteTurn: null,
+      stopPump: null,
+      pumpDone: Promise.resolve(),
+    };
+    try {
+      if (typeof warm.initializationResult === 'function') {
+        await withRemoteControlTimeout(warm.initializationResult(), 'Claude Code did not start in time.');
+      }
+      if (cancelled()) throw new Error('Remote Control was turned off.');
+      this.parkedQuery = parked;
+      this.liveQueryModelVariant = parked.modelVariant;
+      this.startParkedPump(parked);
+      await this.attachRemoteControlBridge(warm);
+      if (this.rcBridgeQuery !== warm) throw new Error(this.rcError ?? 'Remote Control did not start.');
+      console.log('[CLAUDE-CODE] REMOTE_CONTROL: bridge is up on an idle warm query');
+    } catch (error) {
+      if (this.parkedQuery === parked) this.parkedQuery = null;
+      this.closeParkedQuery(parked, 'warm-query-failed');
+      throw error;
+    }
+  }
+
+  /**
+   * Put the bridge on a live query. With a known bridge session it reattaches
+   * (same URL); if that is refused it starts a fresh one. Never throws: the
+   * outcome is the Remote Control state.
+   */
+  private attachRemoteControlBridge(target: Query, opts: { force?: boolean } = {}): Promise<void> {
+    if (this.rcAttaching?.query === target && !opts.force) return this.rcAttaching.promise;
+    const handle = asRemoteControlQuery(target);
+    if (!handle) {
+      this.setRemoteControlState('error', 'The bundled Claude Agent SDK does not support Remote Control.');
+      return Promise.resolve();
+    }
+    const reattachSessionId = this.rcInfo?.bridge_session_id;
+    this.setRemoteControlState(reattachSessionId ? 'reconnecting' : 'connecting', null);
+    const promise: Promise<void> = (async () => {
+      let info: RemoteControlInfo | undefined;
+      try {
+        info = await withRemoteControlTimeout(
+          handle.enableRemoteControl(true, this.rcName, reattachSessionId ? { reattachSessionId } : undefined),
+          'Remote Control did not answer in time.',
+        );
+      } catch (error) {
+        if (!reattachSessionId) throw error;
+        console.warn('[CLAUDE-CODE] REMOTE_CONTROL: reattach refused; starting a new bridge session:', error instanceof Error ? error.message : error);
+        info = await withRemoteControlTimeout(handle.enableRemoteControl(true, this.rcName), 'Remote Control did not answer in time.');
+      }
+      if (!this.rcDesired || this.rcEndedQueries.has(target)) {
+        // Turned off, or the process ended, while the bridge was coming up.
+        if (!this.rcDesired && !this.rcEndedQueries.has(target)) {
+          await handle.enableRemoteControl(false).catch(() => {});
+        }
+        if (this.rcDesired) this.setRemoteControlState('disconnected', null);
+        return;
+      }
+      if (!info?.bridge_session_id) {
+        throw new Error('Remote Control did not start: Claude Code returned no bridge session.');
+      }
+      const reattached = !!reattachSessionId && info.bridge_session_id === reattachSessionId;
+      this.rcInfo = info;
+      this.rcBridgeQuery = target;
+      console.log(`[CLAUDE-CODE] REMOTE_CONTROL: bridge ${reattached ? 'reattached to the same session' : 'started'}`);
+      this.setRemoteControlState(this.rcState === 'connected' ? 'connected' : 'ready', null, true);
+    })()
+      .catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn('[CLAUDE-CODE] REMOTE_CONTROL: could not start the bridge:', message);
+        if (this.rcDesired) this.setRemoteControlState('error', message);
+      })
+      .finally(() => {
+        if (this.rcAttaching?.promise === promise) this.rcAttaching = null;
+      });
+    this.rcAttaching = { query: target, promise };
+    return promise;
+  }
+
+  /** A `system/bridge_state` chunk from the query holding (or getting) the bridge. */
+  private applyBridgeState(raw: string, source: Query | null): void {
+    if (!this.rcDesired) return;
+    if (source && this.rcBridgeQuery && source !== this.rcBridgeQuery && this.rcAttaching?.query !== source) return;
+    const next = mapBridgeState(raw);
+    if (next === this.rcState) return;
+    console.log(`[CLAUDE-CODE] REMOTE_CONTROL: bridge state "${raw}"`);
+    this.setRemoteControlState(next, next === 'error' ? `Remote Control reported "${raw}".` : null);
+  }
+
+  /** The bridge was switched off from claude.ai or the app: honour it. */
+  private handleRemoteSideDisable(): void {
+    console.log('[CLAUDE-CODE] REMOTE_CONTROL: switched off from the remote side');
+    this.rcDesired = false;
+    if (this.rcSessionId) remoteControlCarryOver.clear(this.rcSessionId);
+    this.clearRemoteControlRestoreTimer();
+    this.cancelRemoteControlWarmSpawn();
+    this.rcBridgeQuery = null;
+    this.rcInfo = null;
+    this.discardParkedQuery('remote-side-disabled');
+    this.setRemoteControlState('off', null, true);
+  }
+
+  private setRemoteControlState(state: RemoteControlState, error: string | null, forceEmit = false): void {
+    const changed = state !== this.rcState || error !== this.rcError;
+    this.rcState = state;
+    this.rcError = error;
+    if (changed || forceEmit) this.emitRemoteControlChanged();
+  }
+
+  private emitRemoteControlChanged(): void {
+    if (!this.rcSessionId) return;
+    this.emit('remoteControl:changed', { sessionId: this.rcSessionId, status: this.getRemoteControlStatus() });
+  }
+
+  /** Log a chunk shape once per context (type, subtype and keys; never values or URLs). */
+  private logRemoteControlShapeOnce(context: string, chunk: unknown): void {
+    const key = `${context}:${chunkShapeKey(chunk)}`;
+    if (this.rcLoggedShapes.has(key)) return;
+    this.rcLoggedShapes.add(key);
+    console.log(`[CLAUDE-CODE] REMOTE_CONTROL: ${context}: ${describeChunkShape(chunk)}`);
+  }
+
   /**
    * Process teammate-related side-effects after a tool_result is received.
    * Called from both chunk-processing paths to avoid duplication.
@@ -2418,6 +3289,14 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       this.mcpQuery = this.leadQuery;
       this.checkMcpServerStatuses().catch(() => {});
       this.startMcpHealthChecks();
+    }
+
+    // Remote Control is on but this process has no bridge (it was spawned
+    // after a model switch, abort, crash, drain close or supersede): put the
+    // bridge back, on the same bridge session. Fire-and-forget; it reports
+    // its own failure through the Remote Control state.
+    if (this.rcDesired && this.leadQuery && this.rcBridgeQuery !== this.leadQuery) {
+      void this.attachRemoteControlBridge(this.leadQuery);
     }
 
     // The host has already persisted a provisional first-prompt title before
@@ -2474,6 +3353,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
         this.stopMcpHealthChecks();
         this.mcpQuery = null;
       }
+      if (this.rcDesired) this.noteRemoteControlQueryEnded(query as unknown as Query, 'drain-closed');
     }
 
     const outcome = classifyDrainOutcome({

@@ -112,8 +112,13 @@ export interface BuildSdkOptionsResult {
   helperMethod: 'native' | 'custom';
 }
 
+/**
+ * `initialMessage` is null only for a Remote Control warm query (GH #1480):
+ * the CLI starts with nothing to answer and the first prompt is pushed later.
+ * Every turn passes its user message.
+ */
 export function createPersistentPromptStream(
-  initialMessage: SDKUserMessage,
+  initialMessage: SDKUserMessage | null,
 ): { iterable: AsyncIterable<SDKUserMessage>; controller: PromptStreamController } {
   let ended = false;
   const pushed: SDKUserMessage[] = [];
@@ -125,7 +130,7 @@ export function createPersistentPromptStream(
   };
 
   async function* generator(): AsyncGenerator<SDKUserMessage> {
-    yield initialMessage;
+    if (initialMessage) yield initialMessage;
     // Block here so the SDK's streamInput() doesn't finish iterating and
     // doesn't call transport.endInput() to close the binary's stdin. The
     // ClaudeCodeProvider arms a grace-period timer on the first `result`
